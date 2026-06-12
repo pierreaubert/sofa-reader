@@ -2,10 +2,10 @@
 name = "sofa-reader"
 version = "0.1.6"
 edition = "2024"
-license.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
+license = "MIT"
+repository = "https://github.com/YOUR_USERNAME/sofa-reader"
+keywords = ["sofa", "hrtf", "hdf5", "netcdf", "audio"]
+categories = ["multimedia::audio", "parser-implementations"]
 description = "Pure-Rust SOFA (HDF5/NetCDF4) file reader and writer for HRTF data"
 
 [features]
@@ -13,13 +13,13 @@ default = ["deflate"]
 deflate = ["dep:flate2"]
 
 [dependencies]
-thiserror = { workspace = true }
-flate2 = { workspace = true, optional = true }
-log = { workspace = true }
-serde = { workspace = true }
-rusqlite = { workspace = true }
-bincode = { workspace = true }
+thiserror = "2.0"
+flate2 = { version = "1.1", optional = true }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+rusqlite = "0.34"
+bincode = { version = "2.0", features = ["serde"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-proptest = { workspace = true }
+tempfile = "3"
+proptest = "1.6"

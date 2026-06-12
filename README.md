@@ -54,10 +54,21 @@ let (left, right) = hrtf.get_hrtf_nearest(&pos)?;
 ## Testing
 
 ```bash
-cargo test -p sofa-reader --lib
-cargo check -p sofa-reader && cargo clippy -p sofa-reader
+# Using just
+just test
+
+# Or directly with cargo
+cargo test --lib
+cargo test --test property_tests
+```
+
+## Development
+
+```bash
+just        # list available recipes
+just all    # format check, clippy, tests, and docs
 ```
 
 ## License
 
-See the root workspace `LICENSE` file.
+This project is licensed under the MIT License.
