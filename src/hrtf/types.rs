@@ -52,7 +52,26 @@ pub struct SimpleFreeFieldHrtf<'a> {
 }
 
 pub(super) fn validate_simple_free_field_hrtf(h: &SimpleFreeFieldHrtf<'_>) -> Result<()> {
-    let expected_data = h.measurements * h.receivers * h.frequencies.len();
+    if h.measurements == 0 || h.receivers == 0 || h.frequencies.is_empty() {
+        return Err(SofaError::InvalidStructure(format!(
+            "Empty HRTF layout: M={}, R={}, N={}",
+            h.measurements,
+            h.receivers,
+            h.frequencies.len()
+        )));
+    }
+    let expected_data = h
+        .measurements
+        .checked_mul(h.receivers)
+        .and_then(|v| v.checked_mul(h.frequencies.len()))
+        .ok_or_else(|| {
+            SofaError::InvalidStructure(format!(
+                "HRTF dimensions overflow: M={}, R={}, N={}",
+                h.measurements,
+                h.receivers,
+                h.frequencies.len()
+            ))
+        })?;
     if h.real.len() != expected_data {
         return Err(SofaError::InvalidStructure(format!(
             "Data.Real length {} does not match M*R*N {}",
@@ -67,7 +86,11 @@ pub(super) fn validate_simple_free_field_hrtf(h: &SimpleFreeFieldHrtf<'_>) -> Re
             expected_data
         )));
     }
-    let expected_sources = h.measurements * 3;
+    // M and R are non-zero here (checked above); the checked forms below
+    // only reject absurd values near usize::MAX.
+    let expected_sources = h.measurements.checked_mul(3).ok_or_else(|| {
+        SofaError::InvalidStructure(format!("Source count overflows: M={}", h.measurements))
+    })?;
     if h.source_position.len() != expected_sources {
         return Err(SofaError::InvalidStructure(format!(
             "SourcePosition length {} does not match M*C {}",
@@ -75,7 +98,9 @@ pub(super) fn validate_simple_free_field_hrtf(h: &SimpleFreeFieldHrtf<'_>) -> Re
             expected_sources
         )));
     }
-    let expected_receivers = h.receivers * 3;
+    let expected_receivers = h.receivers.checked_mul(3).ok_or_else(|| {
+        SofaError::InvalidStructure(format!("Receiver count overflows: R={}", h.receivers))
+    })?;
     if h.receiver_position.len() != expected_receivers {
         return Err(SofaError::InvalidStructure(format!(
             "ReceiverPosition length {} does not match R*C {}",

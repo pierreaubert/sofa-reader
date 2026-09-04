@@ -1,4 +1,6 @@
-/target
+target
 Cargo.lock
 .tokensave
 .DS_Store
+.superpowers
+/docs/superpowers

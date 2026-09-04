@@ -8,28 +8,35 @@ default:
     @just --list
 
 # Run all checks: format check, clippy, tests, and doc
-all: check fmt-check clippy test doc
+all: check check-minimal fmt-check clippy test doc
 
 # Build the crate
 check:
-    cargo check
+    cargo check --all-targets
+
+# Check with minimal features (sqlite/deflate paths must stay optional-safe)
+check-minimal:
+    cargo check --all-targets --no-default-features
 
 # Build in release mode
 build:
     cargo build --release
 
-# Run the test suite (lib + integration)
+# Run the full test suite (lib + integration + doctests)
 test:
-    cargo test --lib
-    cargo test --test property_tests
+    cargo test --all-features
+
+# Run tests without default features
+test-minimal:
+    cargo test --no-default-features --lib
 
 # Run tests with all features
 test-all:
     cargo test --all-features
 
-# Run clippy (warnings reported but do not fail the build)
+# Run clippy (warnings fail the build, same as CI)
 clippy:
-    cargo clippy --all-targets --all-features
+    cargo clippy --all-targets --all-features -- -D warnings
 
 # Format code
 fmt:

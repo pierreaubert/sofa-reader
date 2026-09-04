@@ -1,3 +1,42 @@
+//! Pure-Rust SOFA (HDF5/NetCDF4) reader and writer for HRTF data.
+//!
+//! # Example
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use sofa_reader::{SofaFile, SofaReader, SofaWriter, SourcePosition};
+//!
+//! let dir = tempfile::tempdir()?;
+//! let path = dir.path().join("example.sofa");
+//!
+//! let mut w = SofaWriter::new();
+//! w.add_attribute_str("Conventions", "SOFA");
+//! w.add_attribute_str("Version", "2.1");
+//! w.add_attribute_str("SOFAConventions", "SimpleFreeFieldHRIR");
+//! w.add_attribute_str("SOFAConventionsVersion", "1.0");
+//! w.add_attribute_str("DataType", "FIR");
+//! w.add_dimension("M", 1);
+//! w.add_dimension("R", 2);
+//! w.add_dimension("N", 2);
+//! w.add_dimension("C", 3);
+//! w.add_variable_f32("Data.SamplingRate", &[]);
+//! w.write_scalar_f32("Data.SamplingRate", 48000.0)?;
+//! w.add_variable_f32("SourcePosition", &["M", "C"]);
+//! w.write_f32("SourcePosition", &[0.0, 0.0, 1.0])?;
+//! w.add_variable_f32("Data.IR", &["M", "R", "N"]);
+//! w.write_f32("Data.IR", &[0.0, 0.0, 0.0, 0.0])?;
+//! w.finish(&path)?;
+//!
+//! let reader = SofaReader::open(&path)?;
+//! assert_eq!(reader.dimension("M")?, 1);
+//!
+//! let sofa = SofaFile::strict_load(&path)?;
+//! let query = SourcePosition::new(0.0, 0.0, 1.0);
+//! assert!(sofa.get_hrtf_at_position(&query).is_some());
+//! # Ok(())
+//! # }
+//! ```
+
 pub mod error;
 mod hdf5;
 mod hrtf;
@@ -23,6 +62,11 @@ impl SofaReader {
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let hdf5 = Hdf5File::from_bytes(data)?;
+        Ok(Self { hdf5 })
+    }
+
+    pub fn from_slice(data: &[u8]) -> Result<Self> {
+        let hdf5 = Hdf5File::from_slice(data)?;
         Ok(Self { hdf5 })
     }
 
@@ -94,16 +138,31 @@ impl SofaWriter {
         self.inner.add_variable_f64(name, dims);
     }
 
-    pub fn add_variable_attribute_str(&mut self, variable: &str, name: &str, value: &str) {
-        self.inner.add_variable_attribute_str(variable, name, value);
+    pub fn add_variable_attribute_str(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.inner.add_variable_attribute_str(variable, name, value)
     }
 
-    pub fn add_variable_attribute_f32(&mut self, variable: &str, name: &str, value: f32) {
-        self.inner.add_variable_attribute_f32(variable, name, value);
+    pub fn add_variable_attribute_f32(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: f32,
+    ) -> Result<()> {
+        self.inner.add_variable_attribute_f32(variable, name, value)
     }
 
-    pub fn add_variable_attribute_f64(&mut self, variable: &str, name: &str, value: f64) {
-        self.inner.add_variable_attribute_f64(variable, name, value);
+    pub fn add_variable_attribute_f64(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: f64,
+    ) -> Result<()> {
+        self.inner.add_variable_attribute_f64(variable, name, value)
     }
 
     pub fn write_scalar_f32(&mut self, name: &str, value: f32) -> Result<()> {

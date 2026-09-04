@@ -7,7 +7,7 @@ use crate::{Result, SofaError};
 use std::path::Path;
 
 /// SOFA/HRTF file data loaded into memory.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SofaFile {
     /// Sample rate in Hz.
     pub sample_rate: f32,
@@ -36,7 +36,12 @@ impl SofaFile {
         let path_ref = path.as_ref();
         let ext = path_ref.extension().and_then(|e| e.to_str()).unwrap_or("");
         match ext {
+            #[cfg(feature = "sqlite")]
             "hrtfdb" | "sqlite" | "db" => Self::try_load_sqlite(path_ref),
+            #[cfg(not(feature = "sqlite"))]
+            "hrtfdb" | "sqlite" | "db" => Err(SofaError::Unsupported(
+                "SQLite caches need the crate 'sqlite' feature".into(),
+            )),
             _ => Self::load_sofa(path_ref, false),
         }
     }
@@ -47,11 +52,13 @@ impl SofaFile {
     }
 
     /// Load HRTF data from a `.hrtfdb` SQLite cache.
+    #[cfg(feature = "sqlite")]
     pub fn load_sqlite<P: AsRef<Path>>(path: P) -> std::result::Result<Self, String> {
         Self::try_load_sqlite(path).map_err(|e| e.to_string())
     }
 
     /// Load HRTF data from a `.hrtfdb` SQLite cache using `SofaError`.
+    #[cfg(feature = "sqlite")]
     pub fn try_load_sqlite<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path_ref = path.as_ref();
         let conn = rusqlite::Connection::open(path_ref)?;
@@ -111,14 +118,40 @@ impl SofaFile {
                 .map_err(SofaError::from)?
         };
 
+        if positions.len() != num_measurements {
+            return Err(SofaError::InvalidStructure(format!(
+                "SQLite cache holds {} positions but metadata says num_measurements={}",
+                positions.len(),
+                num_measurements
+            )));
+        }
+
+        let expected_samples = num_measurements
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(ir_length))
+            .ok_or_else(|| {
+                SofaError::InvalidStructure(format!(
+                    "SQLite dimensions overflow: M={num_measurements}, N={ir_length}"
+                ))
+            })?;
+
         let impulse_responses: Vec<f32> = {
             let blob: Vec<u8> = conn.query_row(
                 "SELECT value FROM data WHERE key = 'impulse_responses'",
                 [],
                 |row| row.get(0),
             )?;
-            blob.chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            if !blob.len().is_multiple_of(4) || blob.len() / 4 != expected_samples {
+                return Err(SofaError::InvalidStructure(format!(
+                    "SQLite impulse blob has {} bytes, expected M*2*N*4 = {}",
+                    blob.len(),
+                    expected_samples * 4
+                )));
+            }
+            let (chunks, _) = blob.as_chunks::<4>();
+            chunks
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect()
         };
 
@@ -206,7 +239,10 @@ impl SofaFile {
         };
         log::debug!("[SOFA] Coordinate system: {:?}", coord_system);
 
-        let mut positions = Vec::with_capacity(num_measurements);
+        // Capacity is only a hint: clamp it so a corrupt M cannot turn
+        // allocation itself into an abort. The length is still exactly
+        // `num_measurements`, validated against the position payload below.
+        let mut positions = Vec::with_capacity(num_measurements.min(1024));
         for i in 0..num_measurements {
             let idx = i * 3;
             let pos = match coord_system {
@@ -313,10 +349,16 @@ impl SofaFile {
         if index >= self.num_measurements {
             return None;
         }
-        let position = self.positions[index];
-        let offset = index * 2 * self.ir_length;
-        let left = &self.impulse_responses[offset..offset + self.ir_length];
-        let right = &self.impulse_responses[offset + self.ir_length..offset + 2 * self.ir_length];
+        // `SofaFile` fields are public, so a hand-built (or older-cache)
+        // instance can disagree with its own dimensions. Every access below
+        // is checked: inconsistent state yields `None`, never a panic.
+        let position = *self.positions.get(index)?;
+        let frame = 2usize.checked_mul(self.ir_length)?;
+        let offset = index.checked_mul(frame)?;
+        let end_left = offset.checked_add(self.ir_length)?;
+        let end_right = frame.checked_add(offset)?;
+        let left = self.impulse_responses.get(offset..end_left)?;
+        let right = self.impulse_responses.get(end_left..end_right)?;
         Some((position, left, right))
     }
 
@@ -416,6 +458,10 @@ impl SofaFile {
     ///
     /// Falls back to the nearest measurement if any of the three lookups
     /// collapse onto the same index. Returns `None` if the database is empty.
+    ///
+    /// Note: the returned [`HrtfData::position`] is the *nearest*
+    /// measurement's position, not an interpolated coordinate — the IR data
+    /// is blended, the reported position is not.
     pub fn get_hrtf_interpolated(&self, position: &SourcePosition) -> Option<HrtfData> {
         if self.num_measurements == 0 {
             return None;

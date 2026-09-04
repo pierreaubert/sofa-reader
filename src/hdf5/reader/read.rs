@@ -4,7 +4,7 @@ use super::types::ByteOrder;
 
 /// Read a 4-byte float from a slice, honouring byte order.
 pub(super) fn read_f32_bytes(c: &[u8], bo: ByteOrder) -> f32 {
-    let arr: [u8; 4] = c.try_into().expect("chunks_exact(4) yields 4-byte slices");
+    let arr: [u8; 4] = c.try_into().expect("4-byte float chunks");
     match bo {
         ByteOrder::Little => f32::from_le_bytes(arr),
         ByteOrder::Big => f32::from_be_bytes(arr),
@@ -13,7 +13,7 @@ pub(super) fn read_f32_bytes(c: &[u8], bo: ByteOrder) -> f32 {
 
 /// Read an 8-byte float from a slice, honouring byte order.
 pub(super) fn read_f64_bytes(c: &[u8], bo: ByteOrder) -> f64 {
-    let arr: [u8; 8] = c.try_into().expect("chunks_exact(8) yields 8-byte slices");
+    let arr: [u8; 8] = c.try_into().expect("8-byte float chunks");
     match bo {
         ByteOrder::Little => f64::from_le_bytes(arr),
         ByteOrder::Big => f64::from_be_bytes(arr),

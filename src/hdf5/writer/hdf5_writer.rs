@@ -67,84 +67,84 @@ impl Hdf5Writer {
         });
     }
 
+    /// Declare a variable's dimensions first with [`Self::add_variable_f32`]
+    /// or [`Self::add_variable_f64`]; writing to an undeclared variable is a
+    /// `MissingVariable` error, not a silent dimensionless variable.
     pub fn write_scalar_f32(&mut self, name: &str, value: f32) -> Result<()> {
-        if let Some(var) = self.variables.iter_mut().find(|v| v.name == name) {
-            var.data = VarData::ScalarF32(value);
-        } else {
-            self.variables.push(VarDef {
-                name: name.to_string(),
-                dim_names: Vec::new(),
-                data: VarData::ScalarF32(value),
-                attributes: Vec::new(),
-            });
-        }
+        let var = self.find_variable_mut(name)?;
+        var.data = VarData::ScalarF32(value);
         Ok(())
     }
 
     pub fn write_scalar_f64(&mut self, name: &str, value: f64) -> Result<()> {
-        if let Some(var) = self.variables.iter_mut().find(|v| v.name == name) {
-            var.data = VarData::ScalarF64(value);
-        } else {
-            self.variables.push(VarDef {
-                name: name.to_string(),
-                dim_names: Vec::new(),
-                data: VarData::ScalarF64(value),
-                attributes: Vec::new(),
-            });
-        }
+        let var = self.find_variable_mut(name)?;
+        var.data = VarData::ScalarF64(value);
         Ok(())
     }
 
     pub fn write_f32(&mut self, name: &str, data: &[f32]) -> Result<()> {
-        if let Some(var) = self.variables.iter_mut().find(|v| v.name == name) {
-            var.data = VarData::ArrayF32(data.to_vec());
-        } else {
-            self.variables.push(VarDef {
-                name: name.to_string(),
-                dim_names: Vec::new(),
-                data: VarData::ArrayF32(data.to_vec()),
-                attributes: Vec::new(),
-            });
-        }
+        let var = self.find_variable_mut(name)?;
+        var.data = VarData::ArrayF32(data.to_vec());
         Ok(())
     }
 
     pub fn write_f64(&mut self, name: &str, data: &[f64]) -> Result<()> {
-        if let Some(var) = self.variables.iter_mut().find(|v| v.name == name) {
-            var.data = VarData::ArrayF64(data.to_vec());
-        } else {
-            self.variables.push(VarDef {
-                name: name.to_string(),
-                dim_names: Vec::new(),
-                data: VarData::ArrayF64(data.to_vec()),
-                attributes: Vec::new(),
-            });
-        }
+        let var = self.find_variable_mut(name)?;
+        var.data = VarData::ArrayF64(data.to_vec());
         Ok(())
     }
 
-    pub fn add_variable_attribute_str(&mut self, variable: &str, name: &str, value: &str) {
-        self.add_variable_attribute(variable, name, AttrData::String(value.to_string()));
+    fn find_variable_mut(&mut self, name: &str) -> Result<&mut VarDef> {
+        self.variables
+            .iter_mut()
+            .find(|v| v.name == name)
+            .ok_or_else(|| {
+                SofaError::MissingVariable(format!(
+                    "{name} (declare it with add_variable_f32/f64 first)"
+                ))
+            })
     }
 
-    pub fn add_variable_attribute_f32(&mut self, variable: &str, name: &str, value: f32) {
-        self.add_variable_attribute(variable, name, AttrData::Float32(value));
+    pub fn add_variable_attribute_str(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.add_variable_attribute(variable, name, AttrData::String(value.to_string()))
     }
 
-    pub fn add_variable_attribute_f64(&mut self, variable: &str, name: &str, value: f64) {
-        self.add_variable_attribute(variable, name, AttrData::Float64(value));
+    pub fn add_variable_attribute_f32(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: f32,
+    ) -> Result<()> {
+        self.add_variable_attribute(variable, name, AttrData::Float32(value))
     }
 
-    pub(super) fn add_variable_attribute(&mut self, variable: &str, name: &str, value: AttrData) {
+    pub fn add_variable_attribute_f64(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: f64,
+    ) -> Result<()> {
+        self.add_variable_attribute(variable, name, AttrData::Float64(value))
+    }
+
+    pub(super) fn add_variable_attribute(
+        &mut self,
+        variable: &str,
+        name: &str,
+        value: AttrData,
+    ) -> Result<()> {
         if let Some(var) = self.variables.iter_mut().find(|v| v.name == variable) {
             var.attributes.push((name.to_string(), value));
+            Ok(())
         } else {
-            self.variables.push(VarDef {
-                name: variable.to_string(),
-                dim_names: Vec::new(),
-                data: VarData::ArrayF32(Vec::new()),
-                attributes: vec![(name.to_string(), value)],
-            });
+            Err(SofaError::MissingVariable(format!(
+                "{variable} (declare it with add_variable_f32/f64 first)"
+            )))
         }
     }
 
@@ -183,10 +183,13 @@ impl Hdf5Writer {
             if self.variables.iter().any(|var| var.name == *name) {
                 continue;
             }
+            let byte_len = size.checked_mul(4).ok_or_else(|| {
+                SofaError::InvalidStructure(format!("Dimension '{name}' size {size} overflows"))
+            })?;
             children.push(ChildObject {
                 name: name.clone(),
                 dims: vec![size as u64],
-                data: vec![0u8; size * 4], // dummy f32 data for dim scale
+                data: vec![0u8; byte_len], // dummy f32 data for dim scale
                 dtype_class: 1,            // float
                 dtype_size: 4,
                 is_dim_scale: true,
@@ -194,13 +197,16 @@ impl Hdf5Writer {
             });
         }
 
-        // Variable datasets
+        // Variable datasets. An unknown dimension name is a caller bug, not a
+        // size-1 dimension — fail loudly instead of writing a corrupt file.
         for var in &self.variables {
-            let dims: Vec<u64> = var
-                .dim_names
-                .iter()
-                .map(|d| *self.dimensions.get(d).unwrap_or(&1) as u64)
-                .collect();
+            let mut dims = Vec::with_capacity(var.dim_names.len());
+            for d in &var.dim_names {
+                let size = self.dimensions.get(d).copied().ok_or_else(|| {
+                    SofaError::MissingDimension(format!("{d} (used by variable '{}')", var.name))
+                })?;
+                dims.push(size as u64);
+            }
 
             let data = match &var.data {
                 VarData::ScalarF32(v) => v.to_le_bytes().to_vec(),
@@ -272,93 +278,90 @@ impl Hdf5Writer {
         buf: &mut Vec<u8>,
         sb_size: usize,
     ) -> Result<usize> {
-        // First pass: build all child OHs and data to know their addresses
-        // The root OH comes first, then child OHs, then data
+        // Layout: root OH first, then child OHs, then data. Child OH
+        // addresses depend on the root OH size, but root OH *byte size*
+        // depends only on names/attributes — addresses are fixed-width LE —
+        // so size it exactly with dummy addresses instead of a placeholder.
+        let proto_addrs: Vec<(String, u64)> =
+            children.iter().map(|c| (c.name.clone(), 0)).collect();
+        let root_len = self
+            .build_root_oh_bytes(&proto_addrs)?
+            .len()
+            .next_multiple_of(8);
 
-        // Estimate root OH size to know where children start
-        let root_oh_placeholder_size = 4096; // generous placeholder
-        let root_oh_start = 0;
-
-        // Reserve space for root OH
-        buf.resize(root_oh_placeholder_size, 0);
-
-        // Build child objects
-        struct ChildAddr {
-            #[allow(dead_code)]
-            oh_addr: u64,
-            data_addr: u64,
-        }
-
-        let mut child_addrs = Vec::with_capacity(children.len());
-
+        // Pass 1: child OHs with placeholder data addresses, recording each
+        // OH length so both OH and data addresses are known arithmetically.
+        let mut pass1 = Vec::new();
+        let mut oh_lens = Vec::with_capacity(children.len());
         for child in children {
-            let oh_offset = buf.len();
-            let oh_addr = (sb_size + oh_offset) as u64;
-
-            // Write child OH (v2) with dataspace, datatype, layout messages
-            // We'll write data contiguously after all OHs
-            let data_placeholder_addr = UNDEF_ADDR; // fix up later
-            self.write_child_oh(buf, child, data_placeholder_addr)?;
-
-            child_addrs.push(ChildAddr {
-                oh_addr,
-                data_addr: 0, // will be fixed
-            });
+            let start = pass1.len();
+            self.write_child_oh(&mut pass1, child, UNDEF_ADDR)?;
+            oh_lens.push(pass1.len() - start);
         }
 
-        // Now write data sections and fix up addresses
-        for (i, child) in children.iter().enumerate() {
-            let data_offset = buf.len();
-            child_addrs[i].data_addr = (sb_size + data_offset) as u64;
-            buf.extend_from_slice(&child.data);
+        let mut oh_addrs = Vec::with_capacity(children.len());
+        let mut cursor = sb_size + root_len;
+        for &len in &oh_lens {
+            oh_addrs.push(cursor as u64);
+            cursor += len;
+        }
+        let mut data_addrs = Vec::with_capacity(children.len());
+        for child in children {
+            data_addrs.push(cursor as u64);
+            cursor += child.data.len().next_multiple_of(8);
+        }
 
-            // Pad to 8 bytes
+        // Pass 2: root space + child OHs with real data addresses + data.
+        buf.resize(root_len, 0);
+        for (child, &data_addr) in children.iter().zip(&data_addrs) {
+            self.write_child_oh(buf, child, data_addr)?;
+        }
+        for child in children {
+            buf.extend_from_slice(&child.data);
             while !buf.len().is_multiple_of(8) {
                 buf.push(0);
             }
         }
 
-        // Rebuild child object headers once real contiguous data addresses are known.
-        let mut new_buf = Vec::with_capacity(buf.len());
-        new_buf.resize(root_oh_placeholder_size, 0);
-
-        let mut new_child_addrs = Vec::with_capacity(children.len());
-
-        for (i, child) in children.iter().enumerate() {
-            let oh_offset = new_buf.len();
-            let oh_addr = (sb_size + oh_offset) as u64;
-            self.write_child_oh(&mut new_buf, child, child_addrs[i].data_addr)?;
-            new_child_addrs.push((child.name.clone(), oh_addr));
-        }
-
-        // Copy data sections
-        for child in children {
-            new_buf.extend_from_slice(&child.data);
-            while new_buf.len() % 8 != 0 {
-                new_buf.push(0);
-            }
-        }
-
-        // Now build the actual root OH
-        let root_oh_bytes = self.build_root_oh_bytes(&new_child_addrs)?;
-        if root_oh_bytes.len() > root_oh_placeholder_size {
+        // Real root OH. Identical length by construction (only the 8-byte
+        // address payloads changed); verify rather than assume.
+        let named: Vec<(String, u64)> = children
+            .iter()
+            .zip(&oh_addrs)
+            .map(|(c, &a)| (c.name.clone(), a))
+            .collect();
+        let root_oh_bytes = self.build_root_oh_bytes(&named)?;
+        if root_oh_bytes.len().next_multiple_of(8) != root_len {
             return Err(SofaError::InvalidStructure(
-                "Root OH too large for placeholder".into(),
+                "Root object header size changed between layout passes".into(),
             ));
         }
+        buf[..root_oh_bytes.len()].copy_from_slice(&root_oh_bytes);
 
-        // Copy root OH into the reserved space (pad with zeros)
-        new_buf[..root_oh_bytes.len()].copy_from_slice(&root_oh_bytes);
-
-        *buf = new_buf;
-        Ok(root_oh_start)
+        Ok(0)
     }
 
     pub(super) fn build_root_oh_bytes(&self, children: &[(String, u64)]) -> Result<Vec<u8>> {
         let mut msgs = Vec::new();
 
+        // Link info with empty dense indexes, then group info: without these
+        // the reference library cannot classify this object header as a
+        // group ("unable to determine object class"). Byte-identical to what
+        // libhdf5 writes for a group with no dense link storage.
+        let mut link_info = vec![0u8, 0]; // version 0, flags 0
+        link_info.extend_from_slice(&UNDEF_ADDR.to_le_bytes()); // fractal heap
+        link_info.extend_from_slice(&UNDEF_ADDR.to_le_bytes()); // name B-tree
+        msgs.push((0x02u8, link_info));
+        msgs.push((0x0Au8, vec![0u8, 0])); // group info, default phase values
+
         // Build link messages for each child
         for (name, addr) in children {
+            if name.len() > u16::MAX as usize {
+                return Err(SofaError::InvalidStructure(format!(
+                    "Object name too long ({} bytes)",
+                    name.len()
+                )));
+            }
             let mut link_msg = Vec::new();
             link_msg.push(1); // version
             let name_bytes = name.as_bytes();
@@ -402,8 +405,9 @@ impl Hdf5Writer {
         let flags: u8 = 0x02; // 4-byte chunk size, no creation order
         oh.push(flags);
 
-        // chunk #0 size (4 bytes for flags & 0x03 = 2)
-        let chunk_size = total_msg_size + 4; // +4 for checksum
+        // chunk #0 size (4 bytes for flags & 0x03 = 2). This covers the
+        // messages only; the checksum is appended after the chunk.
+        let chunk_size = total_msg_size;
         oh.extend_from_slice(&(chunk_size as u32).to_le_bytes());
 
         // Messages
@@ -414,8 +418,9 @@ impl Hdf5Writer {
             oh.extend_from_slice(msg_data);
         }
 
-        // Checksum at end of chunk
-        let cksum = self.checksum(&oh[4..]); // checksum covers version+flags+size+messages
+        // Checksum at end of chunk. Like the superblock checksum, it covers
+        // everything before it — including the OHDR signature.
+        let cksum = self.checksum(&oh);
         oh.extend_from_slice(&cksum.to_le_bytes());
 
         Ok(oh)
@@ -437,10 +442,12 @@ impl Hdf5Writer {
         let dt_msg = self.build_datatype_msg(child.dtype_class, child.dtype_size);
         msgs.push((0x03u8, dt_msg));
 
-        // Fill value message (v3) with an explicit NaN fill for float datasets.
-        let fv_msg = self.build_fill_value_msg(child);
-        msgs.push((0x05u8, fv_msg));
-
+        // No fill-value message: every dataset we write is fully populated
+        // contiguous storage, so fill is never consulted. (An earlier
+        // revision wrote a v3 fill message with a hand-rolled layout that
+        // the reference library rejects; omitting it is always legal and
+        // reads back as the default zero fill.)
+        //
         // Layout message (contiguous, v3)
         let layout_msg = self.build_layout_msg(data_addr, child.data.len() as u64);
         msgs.push((0x08u8, layout_msg));
@@ -463,14 +470,14 @@ impl Hdf5Writer {
         let total_msg_size: usize = msgs.iter().map(|(_, d)| 1 + 2 + 1 + d.len()).sum();
 
         // OHDR v2
+        let oh_start = buf.len();
         buf.extend_from_slice(b"OHDR");
         buf.push(2); // version
         let flags: u8 = 0x02; // 4-byte chunk size
         buf.push(flags);
-        let chunk_size = total_msg_size + 4; // +4 for checksum
+        // Chunk size covers the messages only; the checksum follows the chunk.
+        let chunk_size = total_msg_size;
         buf.extend_from_slice(&(chunk_size as u32).to_le_bytes());
-
-        let cksum_start = buf.len() - 6; // version+flags+size start
 
         for (msg_type, msg_data) in &msgs {
             buf.push(*msg_type);
@@ -479,7 +486,8 @@ impl Hdf5Writer {
             buf.extend_from_slice(msg_data);
         }
 
-        let cksum = self.checksum(&buf[cksum_start + 4..]); // skip OHDR signature
+        // Checksum covers everything before it, including the OHDR signature.
+        let cksum = self.checksum(&buf[oh_start..]);
         buf.extend_from_slice(&cksum.to_le_bytes());
 
         // Pad to 8-byte alignment
@@ -560,21 +568,6 @@ impl Hdf5Writer {
         msg
     }
 
-    pub(super) fn build_fill_value_msg(&self, child: &ChildObject) -> Vec<u8> {
-        let fill = match (child.dtype_class, child.dtype_size) {
-            (1, 4) => f32::NAN.to_le_bytes().to_vec(),
-            (1, 8) => f64::NAN.to_le_bytes().to_vec(),
-            (_, size) => vec![0; size as usize],
-        };
-
-        let mut msg = Vec::with_capacity(2 + 4 + fill.len());
-        msg.push(3); // version
-        msg.push(0x20); // fill value is defined
-        msg.extend_from_slice(&(fill.len() as u32).to_le_bytes());
-        msg.extend_from_slice(&fill);
-        msg
-    }
-
     pub(super) fn build_attribute_msg(&self, name: &str, value: &AttrData) -> Vec<u8> {
         let mut msg = Vec::new();
         let name_bytes = name.as_bytes();
@@ -628,7 +621,9 @@ impl Hdf5Writer {
         let mut msg = Vec::new();
         let class_and_version = (1 << 4) | 3; // version 1, class 3 (string)
         msg.push(class_and_version);
-        msg.extend_from_slice(&[0x01, 0x00, 0x00]); // null-padded, ASCII
+        // Padding type 0 (null-terminated), character set ASCII — matches
+        // what the reference library writes for fixed-length strings.
+        msg.extend_from_slice(&[0x00, 0x00, 0x00]);
         msg.extend_from_slice(&size.to_le_bytes());
         msg
     }

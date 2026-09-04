@@ -13,9 +13,13 @@ First-party in-house library. The standard HDF5 library is hard to build portabl
 ## Testing
 
 ```bash
-cargo test -p sofa-reader --lib
-cargo check -p sofa-reader && cargo clippy -p sofa-reader
+just all  # check + check-minimal + fmt-check + clippy (-D warnings) + test + doc
 ```
+
+CI (`.github/workflows/ci.yml`, ubuntu + macOS) runs the same gates plus
+`--no-default-features` builds. Clippy warnings fail the build; the full
+`cargo test --all-features` suite (lib + `tests/malformed.rs` +
+`tests/property_tests.rs` + doctests) must pass — not just `--lib`.
 
 ## Important Notes
 

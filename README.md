@@ -22,8 +22,8 @@ Provides reading and writing of Spatially Oriented Format for Acoustics (SOFA) f
 use sofa_reader::SofaReader;
 
 let reader = SofaReader::open("hrtf.sofa")?;
-let dims = reader.dimension("M")?;
-let data = reader.read_f32("Data.IR")?;
+let m = reader.dimension("M")?;
+let ir = reader.read_f32("Data.IR")?;
 ```
 
 ### HRTF API
@@ -31,13 +31,31 @@ let data = reader.read_f32("Data.IR")?;
 ```rust
 use sofa_reader::{SofaFile, SourcePosition};
 
-let sofa = SofaFile::open("hrtf.sofa")?;
-let hrtf = sofa.hrtf_data()?;
+let sofa = SofaFile::try_load("hrtf.sofa")?;
 
-// Find nearest HRTF for a direction
-let pos = SourcePosition::spherical(30.0, 0.0, 1.0); // azimuth, elevation, distance
-let (left, right) = hrtf.get_hrtf_nearest(&pos)?;
+// Nearest HRTF for a direction (azimuth, elevation, distance)
+let query = SourcePosition::new(30.0, 0.0, 1.0);
+let hrtf = sofa.get_hrtf_at_position(&query).expect("no measurements");
+println!("left IR length: {}", hrtf.ir_left.len());
 ```
+
+### Writing
+
+```rust
+use sofa_reader::SofaWriter;
+
+let mut w = SofaWriter::new();
+w.add_attribute_str("Conventions", "SOFA");
+w.add_attribute_str("SOFAConventions", "SimpleFreeFieldHRIR");
+// Declare dimensions, then variables, then payloads:
+w.add_dimension("M", 1);
+w.add_variable_f32("Data.SamplingRate", &[]);
+w.write_scalar_f32("Data.SamplingRate", 48000.0)?;
+w.finish("out.sofa")?;
+```
+
+(The crate-level docs in `src/lib.rs` contain the same flow as a
+compile-checked doctest, so the examples cannot rot.)
 
 ## Module Layout
 
@@ -54,12 +72,11 @@ let (left, right) = hrtf.get_hrtf_nearest(&pos)?;
 ## Testing
 
 ```bash
-# Using just
-just test
+# Using just (mirrors CI)
+just all
 
 # Or directly with cargo
-cargo test --lib
-cargo test --test property_tests
+cargo test --all-features
 ```
 
 ## Development

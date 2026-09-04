@@ -7,9 +7,10 @@ pub(super) fn add_coordinate_attributes(
     writer: &mut SofaWriter,
     variable: &str,
     coords: CoordinateSystem,
-) {
-    writer.add_variable_attribute_str(variable, "Type", coordinate_type(coords));
-    writer.add_variable_attribute_str(variable, "Units", coordinate_units(coords));
+) -> crate::Result<()> {
+    writer.add_variable_attribute_str(variable, "Type", coordinate_type(coords))?;
+    writer.add_variable_attribute_str(variable, "Units", coordinate_units(coords))?;
+    Ok(())
 }
 
 pub(super) fn coordinate_type(coords: CoordinateSystem) -> &'static str {

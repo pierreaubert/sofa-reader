@@ -47,6 +47,33 @@ pub struct Hdf5File {
     pub(super) dimensions: HashMap<String, u64>,
 }
 
+/// In-progress dataset parse state threaded through the object-header
+/// message walkers. The same triple travels through every walker, so
+/// bundling it keeps the recursive functions small without obscuring
+/// the call graph.
+pub(super) struct DatasetParts<'a> {
+    pub(super) ds: &'a mut DatasetInfo,
+    pub(super) attrs: &'a mut HashMap<String, AttrValue>,
+    pub(super) filters: &'a mut Vec<Filter>,
+}
+
+/// Traversal state for the B-tree v2 descent (dense link/attribute indexes).
+pub(super) struct BtreeV2Walk<'a> {
+    pub(super) btype: u8,
+    pub(super) params: &'a BtreeV2Params,
+    pub(super) fh: &'a FractalHeapInfo,
+    pub(super) records: &'a mut Vec<HeapRecord>,
+}
+
+/// Traversal state for the raw-data chunk B-tree v1 descent.
+pub(super) struct ChunkWalk<'a> {
+    pub(super) ds_dims: &'a [u64],
+    pub(super) chunk_dims: &'a [u32],
+    pub(super) elem_size: usize,
+    pub(super) filters: &'a [Filter],
+    pub(super) output: &'a mut [u8],
+}
+
 impl Hdf5File {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = fs::read(path)?;
@@ -54,19 +81,33 @@ impl Hdf5File {
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
-        if data.len() < 8 || data[..8] != HDF5_SIGNATURE {
+        Self::from_slice(&data)
+    }
+
+    pub fn from_slice(data: &[u8]) -> Result<Self> {
+        if data.len() < 9 || data[..8] != HDF5_SIGNATURE {
             return Err(SofaError::NotHdf5);
         }
 
         let sb_version = data[8];
         let (off_size, len_size, base_addr, root_addr) = match sb_version {
-            0 | 1 => Self::parse_superblock_v0(&data)?,
-            2 | 3 => Self::parse_superblock_v2(&data)?,
+            0 | 1 => Self::parse_superblock_v0(data)?,
+            2 | 3 => Self::parse_superblock_v2(data)?,
             v => return Err(SofaError::UnsupportedSuperblock(v)),
         };
 
+        // Offset/length sizes drive every subsequent read; bound them now so
+        // corrupt values fail here instead of deep in the parser.
+        for (label, size) in [("offset", off_size), ("length", len_size)] {
+            if size == 0 || size > 8 {
+                return Err(SofaError::InvalidStructure(format!(
+                    "Superblock {label} size {size} is outside 1..=8 bytes"
+                )));
+            }
+        }
+
         let mut file = Self {
-            data,
+            data: data.to_vec(),
             off_size,
             len_size,
             base_addr,
@@ -136,17 +177,61 @@ impl Hdf5File {
         Ok((off_size, len_size, base_addr, root_addr))
     }
 
-    pub(super) fn abs_offset(&self, addr: u64) -> usize {
-        (addr - self.base_addr) as usize
+    /// Translate a file address to a buffer offset.
+    ///
+    /// Corrupt files can reference addresses below the base address or beyond
+    /// `usize`; those used to underflow/wrap into a panic and are now a
+    /// regular error.
+    pub(super) fn abs_offset(&self, addr: u64) -> Result<usize> {
+        let rel = addr.checked_sub(self.base_addr).ok_or_else(|| {
+            SofaError::InvalidStructure(format!(
+                "Address 0x{addr:x} is below base address 0x{:x}",
+                self.base_addr
+            ))
+        })?;
+        usize::try_from(rel)
+            .map_err(|_| SofaError::InvalidStructure(format!("Address 0x{addr:x} overflows usize")))
     }
 
-    pub(super) fn cursor_at(&self, addr: u64) -> Cursor<'_> {
-        Cursor::new(
+    /// Borrow `len` bytes at buffer offset `start`, returning `Truncated`
+    /// instead of panicking on corrupt sizes or offsets.
+    pub(super) fn slice_at(&self, start: usize, len: usize) -> Result<&[u8]> {
+        let end = start.checked_add(len).ok_or_else(|| SofaError::Truncated {
+            offset: start as u64,
+            need: len as u64,
+            have: self.data.len().saturating_sub(start) as u64,
+        })?;
+        self.data
+            .get(start..end)
+            .ok_or_else(|| SofaError::Truncated {
+                offset: start as u64,
+                need: len as u64,
+                have: self.data.len().saturating_sub(start) as u64,
+            })
+    }
+
+    pub(super) fn cursor_at(&self, addr: u64) -> Result<Cursor<'_>> {
+        Ok(Cursor::new(
             &self.data,
-            self.abs_offset(addr),
+            self.abs_offset(addr)?,
             self.off_size,
             self.len_size,
-        )
+        ))
+    }
+
+    /// Maximum nesting depth for recursive structures (B-trees, indirect
+    /// blocks, object-header continuations). Real files nest a few levels
+    /// deep; anything beyond this is a corrupt or hostile file, not data.
+    pub(super) const MAX_NESTING: u8 = 32;
+
+    pub(super) fn descend(depth: u8, what: &str) -> Result<u8> {
+        if depth >= Self::MAX_NESTING {
+            return Err(SofaError::InvalidStructure(format!(
+                "{what} exceeds maximum nesting depth {}",
+                Self::MAX_NESTING
+            )));
+        }
+        Ok(depth + 1)
     }
 
     pub(super) fn parse_root_group(&mut self, root_addr: u64) -> Result<()> {
@@ -164,6 +249,13 @@ impl Hdf5File {
         // Process children: datasets become variables, dimension scales become dimensions
         for (name, obj_addr) in &group.children {
             match self.parse_dataset(*obj_addr) {
+                Err(e) => {
+                    // Not every child of the root group is a dataset we can
+                    // use (and corrupt children must not abort the whole
+                    // file), but silently dropping the reason made failures
+                    // undebuggable — always log it.
+                    log::warn!("Skipping unreadable dataset '{name}' at 0x{obj_addr:x}: {e}");
+                }
                 Ok(ds) => {
                     // TODO: Dimension scales have a CLASS=DIMENSION_SCALE attribute,
                     // and the dimension size is the first extent of the dataspace.
@@ -176,7 +268,6 @@ impl Hdf5File {
                     }
                     self.datasets.insert(name.clone(), ds);
                 }
-                Err(_e) => {}
             }
         }
 
@@ -224,14 +315,14 @@ impl Hdf5File {
     }
 
     pub(super) fn parse_group(&self, addr: u64) -> Result<GroupInfo> {
-        let offset = self.abs_offset(addr);
+        let offset = self.abs_offset(addr)?;
         let mut group = GroupInfo {
             children: HashMap::new(),
             attributes: HashMap::new(),
         };
 
         // Check if this is v1 or v2 object header
-        if offset + 4 <= self.data.len() && &self.data[offset..offset + 4] == b"OHDR" {
+        if self.slice_at(offset, 4).is_ok_and(|s| s == b"OHDR") {
             self.parse_oh_v2(addr, &mut group)?;
         } else {
             self.parse_oh_v1(addr, &mut group)?;
@@ -241,7 +332,7 @@ impl Hdf5File {
     }
 
     pub(super) fn parse_oh_v1(&self, addr: u64, group: &mut GroupInfo) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let version = c.u8()?;
         if version != 1 {
             return Err(SofaError::UnsupportedObjectHeader(version));
@@ -256,7 +347,7 @@ impl Hdf5File {
         }
 
         let msg_start = c.pos;
-        let msg_end = msg_start + header_size as usize;
+        let msg_end = msg_start.saturating_add(header_size as usize);
 
         let mut i = 0u16;
         while i < num_messages && c.pos < msg_end {
@@ -272,25 +363,23 @@ impl Hdf5File {
                     self.parse_symbol_table_msg(&mut c, group)?;
                 }
                 MSG_ATTRIBUTE => {
-                    self.parse_attribute_msg_v1(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        &mut group.attributes,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_attribute_msg_v1(msg_data, &mut group.attributes)?;
                 }
                 MSG_OH_CONTINUATION => {
                     let cont_addr = c.offset()?;
                     let cont_len = c.length()?;
                     if cont_addr != UNDEF_ADDR && cont_len > 0 {
-                        self.parse_oh_v1_continuation(cont_addr, cont_len, group)?;
+                        self.parse_oh_v1_continuation(cont_addr, cont_len, group, 0)?;
                     }
-                    c.pos = msg_data_start + msg_size;
+                    c.pos = msg_data_start.saturating_add(msg_size);
                     i += 1;
                     continue;
                 }
                 _ => {}
             }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
             i += 1;
         }
         Ok(())
@@ -301,12 +390,14 @@ impl Hdf5File {
         addr: u64,
         _len: u64,
         group: &mut GroupInfo,
+        depth: u8,
     ) -> Result<()> {
+        let depth = Self::descend(depth, "Object-header continuation")?;
         // Continuation block has raw messages (no header)
-        let mut c = self.cursor_at(addr);
-        let end = c.pos + _len as usize;
+        let mut c = self.cursor_at(addr)?;
+        let end = c.pos.saturating_add(_len as usize);
 
-        while c.pos + 8 <= end {
+        while c.pos.saturating_add(8) <= end {
             let msg_type = c.u16()? as u8;
             let msg_size = c.u16()? as usize;
             let _msg_flags = c.u8()?;
@@ -315,10 +406,8 @@ impl Hdf5File {
 
             match msg_type {
                 MSG_ATTRIBUTE => {
-                    self.parse_attribute_msg_v1(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        &mut group.attributes,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_attribute_msg_v1(msg_data, &mut group.attributes)?;
                 }
                 MSG_SYMBOL_TABLE => {
                     self.parse_symbol_table_msg(&mut c, group)?;
@@ -327,13 +416,13 @@ impl Hdf5File {
                     let cont_addr = c.offset()?;
                     let cont_len = c.length()?;
                     if cont_addr != UNDEF_ADDR && cont_len > 0 {
-                        self.parse_oh_v1_continuation(cont_addr, cont_len, group)?;
+                        self.parse_oh_v1_continuation(cont_addr, cont_len, group, depth)?;
                     }
                 }
                 _ => {}
             }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
         }
         Ok(())
     }
@@ -356,7 +445,7 @@ impl Hdf5File {
     }
 
     pub(super) fn parse_local_heap(&self, addr: u64) -> Result<Vec<u8>> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"HEAP" {
             return Err(SofaError::InvalidStructure(
@@ -369,15 +458,11 @@ impl Hdf5File {
         let _free_list_offset = c.length()?;
         let data_addr = c.offset()?;
 
-        let off = self.abs_offset(data_addr);
-        if off + data_size as usize > self.data.len() {
-            return Err(SofaError::Truncated {
-                offset: data_addr,
-                need: data_size,
-                have: (self.data.len() - off) as u64,
-            });
-        }
-        Ok(self.data[off..off + data_size as usize].to_vec())
+        let off = self.abs_offset(data_addr)?;
+        let data_size = usize::try_from(data_size).map_err(|_| {
+            SofaError::InvalidStructure(format!("Local heap size {data_size} overflows usize"))
+        })?;
+        Ok(self.slice_at(off, data_size)?.to_vec())
     }
 
     pub(super) fn parse_btree_v1(
@@ -386,7 +471,18 @@ impl Hdf5File {
         heap_data: &[u8],
         group: &mut GroupInfo,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        self.parse_btree_v1_inner(addr, heap_data, group, 0)
+    }
+
+    fn parse_btree_v1_inner(
+        &self,
+        addr: u64,
+        heap_data: &[u8],
+        group: &mut GroupInfo,
+        depth: u8,
+    ) -> Result<()> {
+        let depth = Self::descend(depth, "B-tree v1")?;
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"TREE" {
             return Err(SofaError::InvalidStructure(
@@ -418,7 +514,7 @@ impl Hdf5File {
             for _ in 0..entries_used {
                 let _key = c.length()?;
                 let child_addr = c.offset()?;
-                self.parse_btree_v1(child_addr, heap_data, group)?;
+                self.parse_btree_v1_inner(child_addr, heap_data, group, depth)?;
             }
         }
         // HDF5 v1 B-trees store one more key than child pointer: key/child
@@ -434,7 +530,7 @@ impl Hdf5File {
         heap_data: &[u8],
         group: &mut GroupInfo,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"SNOD" {
             return Err(SofaError::InvalidStructure("Bad SNOD signature".into()));
@@ -474,7 +570,7 @@ impl Hdf5File {
     // ---- Object Header v2 ----
 
     pub(super) fn parse_oh_v2(&self, addr: u64, group: &mut GroupInfo) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"OHDR" {
             return Err(SofaError::InvalidStructure("Bad OHDR signature".into()));
@@ -501,10 +597,12 @@ impl Hdf5File {
         let chunk0_size = c.read_sized(chunk_size_bytes as u8)? as usize;
         let creation_order_tracked = flags & 0x04 != 0;
 
+        // Chunk #0 size covers the messages only; the checksum follows the
+        // chunk, so the message region ends exactly at start + size.
         let chunk_data_start = c.pos;
-        let chunk_data_end = chunk_data_start + chunk0_size.saturating_sub(4);
+        let chunk_data_end = chunk_data_start.saturating_add(chunk0_size);
 
-        self.parse_oh_v2_messages(&mut c, chunk_data_end, creation_order_tracked, group)?;
+        self.parse_oh_v2_messages(&mut c, chunk_data_end, creation_order_tracked, group, 0)?;
 
         Ok(())
     }
@@ -515,8 +613,9 @@ impl Hdf5File {
         end: usize,
         creation_order_tracked: bool,
         group: &mut GroupInfo,
+        depth: u8,
     ) -> Result<()> {
-        while c.pos + 4 <= end {
+        while c.pos.saturating_add(4) <= end {
             let msg_type = c.u8()?;
             let msg_size = c.u16()? as usize;
             let _msg_flags = c.u8()?;
@@ -532,45 +631,29 @@ impl Hdf5File {
 
             match msg_type {
                 MSG_LINK_INFO => {
-                    self.parse_link_info_msg(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        group,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_link_info_msg(msg_data, group)?;
                 }
                 MSG_LINK => {
-                    self.parse_link_msg(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        group,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_link_msg(msg_data, group)?;
                 }
                 MSG_ATTRIBUTE => {
-                    self.parse_attribute_msg_v2(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        &mut group.attributes,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_attribute_msg_v2(msg_data, &mut group.attributes)?;
                 }
                 MSG_ATTR_INFO => {
-                    self.parse_attr_info_msg(
-                        &self.data[msg_data_start..msg_data_start + msg_size],
-                        &mut group.attributes,
-                    )?;
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    self.parse_attr_info_msg(msg_data, &mut group.attributes)?;
                 }
                 MSG_SYMBOL_TABLE => {
-                    let mut mc = Cursor::new(
-                        self.data.as_slice(),
-                        msg_data_start,
-                        self.off_size,
-                        self.len_size,
-                    );
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    let mut mc = Cursor::new(msg_data, 0, self.off_size, self.len_size);
                     self.parse_symbol_table_msg(&mut mc, group)?;
                 }
                 MSG_OH_CONTINUATION => {
-                    let mut mc = Cursor::new(
-                        self.data.as_slice(),
-                        msg_data_start,
-                        self.off_size,
-                        self.len_size,
-                    );
+                    let msg_data = self.slice_at(msg_data_start, msg_size)?;
+                    let mut mc = Cursor::new(msg_data, 0, self.off_size, self.len_size);
                     let cont_addr = mc.offset()?;
                     let cont_len = mc.length()?;
                     if cont_addr != UNDEF_ADDR && cont_len > 0 {
@@ -579,6 +662,7 @@ impl Hdf5File {
                             cont_len,
                             creation_order_tracked,
                             group,
+                            depth,
                         )?;
                     }
                 }
@@ -587,7 +671,7 @@ impl Hdf5File {
                 }
             }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
         }
         Ok(())
     }
@@ -598,19 +682,26 @@ impl Hdf5File {
         len: u64,
         creation_order_tracked: bool,
         group: &mut GroupInfo,
+        depth: u8,
     ) -> Result<()> {
-        let offset = self.abs_offset(addr);
+        let depth = Self::descend(depth, "Object-header continuation")?;
+        let offset = self.abs_offset(addr)?;
         // v2 continuation blocks start with "OCHK" signature
-        if offset + 4 <= self.data.len() && &self.data[offset..offset + 4] == b"OCHK" {
-            let mut c = Cursor::new(&self.data, offset + 4, self.off_size, self.len_size);
+        if self.slice_at(offset, 4).is_ok_and(|s| s == b"OCHK") {
+            let mut c = Cursor::new(
+                &self.data,
+                offset.saturating_add(4),
+                self.off_size,
+                self.len_size,
+            );
             // End is addr + len - 4 (for checksum)
-            let end = offset + len as usize - 4;
-            self.parse_oh_v2_messages(&mut c, end, creation_order_tracked, group)?;
+            let end = offset.saturating_add(len as usize).saturating_sub(4);
+            self.parse_oh_v2_messages(&mut c, end, creation_order_tracked, group, depth)?;
         } else {
             // Might be raw messages without OCHK signature
-            let mut c = self.cursor_at(addr);
-            let end = self.abs_offset(addr) + len as usize;
-            self.parse_oh_v2_messages(&mut c, end, creation_order_tracked, group)?;
+            let mut c = self.cursor_at(addr)?;
+            let end = offset.saturating_add(len as usize);
+            self.parse_oh_v2_messages(&mut c, end, creation_order_tracked, group, depth)?;
         }
         Ok(())
     }
@@ -747,7 +838,7 @@ impl Hdf5File {
 
 impl Hdf5File {
     pub(super) fn parse_fractal_heap_header(&self, addr: u64) -> Result<FractalHeapInfo> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"FRHP" {
             return Err(SofaError::InvalidStructure("Bad FRHP signature".into()));
@@ -802,7 +893,7 @@ impl Hdf5File {
         addr: u64,
         fh: &FractalHeapInfo,
     ) -> Result<Vec<HeapRecord>> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"BTHD" {
             return Err(SofaError::InvalidStructure("Bad BTHD signature".into()));
@@ -823,6 +914,15 @@ impl Hdf5File {
             return Ok(Vec::new());
         }
 
+        // The declared depth strictly decreases on every recursion, so capping
+        // it here caps total recursion (a cyclic file cannot loop forever).
+        if depth > Self::MAX_NESTING as u16 {
+            return Err(SofaError::InvalidStructure(format!(
+                "B-tree v2 depth {depth} exceeds maximum {}",
+                Self::MAX_NESTING
+            )));
+        }
+
         let params = BtreeV2Params {
             node_size,
             record_size,
@@ -831,15 +931,13 @@ impl Hdf5File {
         };
 
         let mut records = Vec::new();
-        self.parse_btree_v2_node(
-            root_addr,
-            depth,
-            num_records_root,
+        let mut walk = BtreeV2Walk {
             btype,
-            &params,
+            params: &params,
             fh,
-            &mut records,
-        )?;
+            records: &mut records,
+        };
+        self.parse_btree_v2_node(root_addr, depth, num_records_root, &mut walk)?;
 
         Ok(records)
     }
@@ -849,13 +947,10 @@ impl Hdf5File {
         addr: u64,
         depth: u16,
         num_records: u16,
-        btype: u8,
-        params: &BtreeV2Params,
-        fh: &FractalHeapInfo,
-        records: &mut Vec<HeapRecord>,
+        walk: &mut BtreeV2Walk<'_>,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
-        let record_size = params.record_size;
+        let mut c = self.cursor_at(addr)?;
+        let record_size = walk.params.record_size;
 
         if depth == 0 {
             // Leaf node: BTLF
@@ -873,37 +968,44 @@ impl Hdf5File {
                 // Type 6 (group dense corder): creation_order(8) + heap_id(heap_id_length)
                 // Type 8 (attr dense name): creation_order(8) + hash(4) + heap_id(heap_id_length)
                 // Type 9 (attr dense corder): attr info...
-                let heap_id = match btype {
+                let heap_id = match walk.btype {
                     5 => {
                         // Group links by name hash
                         c.skip(4)?; // hash
-                        c.bytes(fh.heap_id_length as usize)?.to_vec()
+                        c.bytes(walk.fh.heap_id_length as usize)?.to_vec()
                     }
                     6 => {
                         // Group links by creation order
                         c.skip(8)?; // creation_order
-                        c.bytes(fh.heap_id_length as usize)?.to_vec()
+                        c.bytes(walk.fh.heap_id_length as usize)?.to_vec()
                     }
                     8 => {
                         // Attributes by name: heap_id(heap_id_length) + flags(1) + creation_order(4) + hash(4)
-                        c.bytes(fh.heap_id_length as usize)?.to_vec()
+                        c.bytes(walk.fh.heap_id_length as usize)?.to_vec()
                     }
                     9 => {
                         // Attributes by creation order: heap_id(heap_id_length) + flags(1)
-                        c.bytes(fh.heap_id_length as usize)?.to_vec()
+                        c.bytes(walk.fh.heap_id_length as usize)?.to_vec()
                     }
                     _ => {
                         // Generic: skip to heap_id at end
-                        let extra = record_size as usize - fh.heap_id_length as usize;
+                        let extra = (record_size as usize)
+                            .checked_sub(walk.fh.heap_id_length as usize)
+                            .ok_or_else(|| {
+                                SofaError::InvalidStructure(format!(
+                                    "B-tree v2 record size {} smaller than heap-ID length {}",
+                                    record_size, walk.fh.heap_id_length
+                                ))
+                            })?;
                         c.skip(extra)?;
-                        c.bytes(fh.heap_id_length as usize)?.to_vec()
+                        c.bytes(walk.fh.heap_id_length as usize)?.to_vec()
                     }
                 };
 
                 // Ensure we consumed exactly record_size bytes
-                c.pos = rec_start + record_size as usize;
+                c.pos = rec_start.saturating_add(record_size as usize);
 
-                records.push(HeapRecord { heap_id });
+                walk.records.push(HeapRecord { heap_id });
             }
         } else {
             // Internal node: BTIN
@@ -927,9 +1029,9 @@ impl Hdf5File {
             // The width of child_num_records is computed from the max records the
             // child node can hold (per HDF5 spec section IV.A.2.) — NOT a fixed u16.
             let max_below = if depth > 1 {
-                params.max_records_internal(depth - 1)
+                walk.params.max_records_internal(depth - 1)
             } else {
-                params.max_records_leaf()
+                walk.params.max_records_leaf()
             };
             let nrec_bytes = BtreeV2Params::bytes_for(max_below) as usize;
             if nrec_bytes > 8 {
@@ -954,15 +1056,7 @@ impl Hdf5File {
                 }
                 let child_num_records = child_num_records_u64 as u16;
                 if child_addr != UNDEF_ADDR {
-                    self.parse_btree_v2_node(
-                        child_addr,
-                        depth - 1,
-                        child_num_records,
-                        btype,
-                        params,
-                        fh,
-                        records,
-                    )?;
+                    self.parse_btree_v2_node(child_addr, depth - 1, child_num_records, walk)?;
                 }
             }
         }
@@ -1064,6 +1158,7 @@ impl Hdf5File {
             fh.current_rows as usize,
             heap_offset,
             0,
+            0,
         )
     }
 
@@ -1074,8 +1169,10 @@ impl Hdf5File {
         nrows: usize,
         target_offset: u64,
         base_offset: u64,
+        depth: u8,
     ) -> Result<Option<(Vec<u8>, u64)>> {
-        let mut c = self.cursor_at(addr);
+        let depth = Self::descend(depth, "Fractal-heap indirect block")?;
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"FHIB" {
             return Err(SofaError::InvalidStructure("Bad FHIB signature".into()));
@@ -1107,12 +1204,12 @@ impl Hdf5File {
 
                 if child_addr != UNDEF_ADDR
                     && target_offset >= current_offset
-                    && target_offset < current_offset + block_size
+                    && target_offset < current_offset.saturating_add(block_size)
                 {
                     let data = self.read_direct_block(fh, child_addr, block_size)?;
                     return Ok(Some((data, current_offset)));
                 }
-                current_offset += block_size;
+                current_offset = current_offset.saturating_add(block_size);
             }
         }
 
@@ -1126,7 +1223,7 @@ impl Hdf5File {
                 let child_addr = c.offset()?;
                 if child_addr != UNDEF_ADDR
                     && target_offset >= current_offset
-                    && target_offset < current_offset + subtree_size
+                    && target_offset < current_offset.saturating_add(subtree_size)
                 {
                     return self.find_in_indirect_block(
                         fh,
@@ -1134,9 +1231,10 @@ impl Hdf5File {
                         child_nrows,
                         target_offset,
                         current_offset,
+                        depth,
                     );
                 }
-                current_offset += subtree_size;
+                current_offset = current_offset.saturating_add(subtree_size);
             }
         }
 
@@ -1148,7 +1246,8 @@ impl Hdf5File {
             return 0;
         }
         let log2_max = (fh.max_direct_block_size / fh.starting_block_size)
-            .next_power_of_two()
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX)
             .trailing_zeros();
         // Row 0 and 1 have starting_block_size, row 2 has 2×starting, etc.
         (log2_max as usize) + 1
@@ -1158,7 +1257,10 @@ impl Hdf5File {
         if row < 2 {
             fh.starting_block_size
         } else {
-            fh.starting_block_size * (1u64 << (row - 1))
+            // Shift amounts >= 64 would panic; saturate instead — callers treat
+            // absurd sizes as truncated data, not a crash.
+            let shift = (row - 1).min(63) as u32;
+            fh.starting_block_size.saturating_mul(1u64 << shift)
         }
     }
 
@@ -1166,7 +1268,7 @@ impl Hdf5File {
         let tw = fh.table_width as u64;
         let mut size = 0u64;
         for row in 0..nrows {
-            size += Self::row_block_size(fh, row) * tw;
+            size = size.saturating_add(Self::row_block_size(fh, row).saturating_mul(tw));
         }
         size
     }
@@ -1179,16 +1281,11 @@ impl Hdf5File {
     ) -> Result<Vec<u8>> {
         // Return the entire direct block as-is. Heap offsets are relative to
         // the start of the block (including the FHDB header).
-        let off = self.abs_offset(addr);
-        let end = off + block_size as usize;
-        if end > self.data.len() {
-            return Err(SofaError::Truncated {
-                offset: addr,
-                need: block_size,
-                have: (self.data.len() - off) as u64,
-            });
-        }
-        Ok(self.data[off..end].to_vec())
+        let off = self.abs_offset(addr)?;
+        let block_size = usize::try_from(block_size).map_err(|_| {
+            SofaError::InvalidStructure(format!("Direct block size {block_size} overflows usize"))
+        })?;
+        Ok(self.slice_at(off, block_size)?.to_vec())
     }
 
     pub(super) fn read_link_from_heap(
@@ -1256,20 +1353,21 @@ impl Hdf5File {
 
         // Datatype
         let dt_start = c.pos;
-        let (dtype, bo) = self.parse_datatype_msg_with_order(&data[dt_start..])?;
+        let (dtype, bo) =
+            self.parse_datatype_msg_with_order(data.get(dt_start..).unwrap_or(&[]))?;
         if version < 3 {
-            c.pos = dt_start + ((dt_size + 7) & !7);
+            c.pos = dt_start.saturating_add((dt_size + 7) & !7);
         } else {
-            c.pos = dt_start + dt_size;
+            c.pos = dt_start.saturating_add(dt_size);
         }
 
         // Dataspace
         let ds_start = c.pos;
-        let dspace = self.parse_dataspace_msg(&data[ds_start..])?;
+        let dspace = self.parse_dataspace_msg(data.get(ds_start..).unwrap_or(&[]))?;
         if version < 3 {
-            c.pos = ds_start + ((ds_size + 7) & !7);
+            c.pos = ds_start.saturating_add((ds_size + 7) & !7);
         } else {
-            c.pos = ds_start + ds_size;
+            c.pos = ds_start.saturating_add(ds_size);
         }
 
         if dspace.is_null() {
@@ -1278,7 +1376,7 @@ impl Hdf5File {
 
         // Data
         let dims = dspace.dims();
-        let attr_data = &data[c.pos..];
+        let attr_data = data.get(c.pos..).unwrap_or(&[]);
         let value = self.interpret_attr_value(&dtype, bo, &dims, attr_data);
         if let Some(v) = value {
             attrs.insert(name, v);
@@ -1326,13 +1424,14 @@ impl Hdf5File {
 
         // Datatype
         let dt_start = c.pos;
-        let (dtype, bo) = self.parse_datatype_msg_with_order(&data[dt_start..])?;
-        c.pos = dt_start + dt_size;
+        let (dtype, bo) =
+            self.parse_datatype_msg_with_order(data.get(dt_start..).unwrap_or(&[]))?;
+        c.pos = dt_start.saturating_add(dt_size);
 
         // Dataspace
         let ds_start = c.pos;
-        let dspace = self.parse_dataspace_msg(&data[ds_start..])?;
-        c.pos = ds_start + ds_size;
+        let dspace = self.parse_dataspace_msg(data.get(ds_start..).unwrap_or(&[]))?;
+        c.pos = ds_start.saturating_add(ds_size);
 
         if dspace.is_null() {
             return Ok(());
@@ -1340,7 +1439,7 @@ impl Hdf5File {
 
         // Data
         let dims = dspace.dims();
-        let attr_data = &data[c.pos..];
+        let attr_data = data.get(c.pos..).unwrap_or(&[]);
         let value = self.interpret_attr_value(&dtype, bo, &dims, attr_data);
         if let Some(v) = value {
             attrs.insert(name, v);
@@ -1361,18 +1460,23 @@ impl Hdf5File {
         dims: &[u64],
         data: &[u8],
     ) -> Option<AttrValue> {
-        let total_elements: u64 = dims.iter().product::<u64>().max(1);
+        // `product()` panics on overflow; a corrupt attribute header must be
+        // skipped, not crash the process.
+        let total_elements: u64 = dims
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+            .unwrap_or(u64::MAX)
+            .max(1);
         let elem_size = dtype.element_size();
-        let needed = total_elements as usize * elem_size;
+        let needed = (total_elements as usize).checked_mul(elem_size)?;
         if data.len() < needed {
             return None;
         }
 
-        let i32_from = |c: &[u8]| -> i32 {
-            let arr: [u8; 4] = c.try_into().expect("4-byte chunk");
+        let i32_from = |c: &[u8; 4]| -> i32 {
             match bo {
-                ByteOrder::Little => i32::from_le_bytes(arr),
-                ByteOrder::Big => i32::from_be_bytes(arr),
+                ByteOrder::Little => i32::from_le_bytes(*c),
+                ByteOrder::Big => i32::from_be_bytes(*c),
             }
         };
 
@@ -1425,8 +1529,9 @@ impl Hdf5File {
                 if total_elements == 1 && data.len() >= 4 {
                     Some(AttrValue::Float32(read_f32_bytes(&data[..4], bo)))
                 } else {
-                    let arr: Vec<f32> = data
-                        .chunks_exact(4)
+                    let (chunks, _) = data.as_chunks::<4>();
+                    let arr: Vec<f32> = chunks
+                        .iter()
                         .take(total_elements as usize)
                         .map(|c| read_f32_bytes(c, bo))
                         .collect();
@@ -1437,8 +1542,9 @@ impl Hdf5File {
                 if total_elements == 1 && data.len() >= 8 {
                     Some(AttrValue::Float64(read_f64_bytes(&data[..8], bo)))
                 } else {
-                    let arr: Vec<f64> = data
-                        .chunks_exact(8)
+                    let (chunks, _) = data.as_chunks::<8>();
+                    let arr: Vec<f64> = chunks
+                        .iter()
                         .take(total_elements as usize)
                         .map(|c| read_f64_bytes(c, bo))
                         .collect();
@@ -1447,10 +1553,12 @@ impl Hdf5File {
             }
             DType::Int32 => {
                 if total_elements == 1 && data.len() >= 4 {
-                    Some(AttrValue::Int32(i32_from(&data[..4])))
+                    let fixed: &[u8; 4] = data[..4].try_into().ok()?;
+                    Some(AttrValue::Int32(i32_from(fixed)))
                 } else {
-                    let arr: Vec<i32> = data
-                        .chunks_exact(4)
+                    let (chunks, _) = data.as_chunks::<4>();
+                    let arr: Vec<i32> = chunks
+                        .iter()
                         .take(total_elements as usize)
                         .map(i32_from)
                         .collect();
@@ -1458,7 +1566,7 @@ impl Hdf5File {
                 }
             }
             _ => {
-                let n = (total_elements as usize) * elem_size;
+                let n = (total_elements as usize).checked_mul(elem_size)?;
                 if n <= data.len() {
                     Some(AttrValue::Uint8Array(data[..n].to_vec()))
                 } else {
@@ -1474,7 +1582,7 @@ impl Hdf5File {
         index: u32,
         _expected_len: u32,
     ) -> Result<String> {
-        let mut c = self.cursor_at(gh_addr);
+        let mut c = self.cursor_at(gh_addr)?;
         let sig = c.bytes(4)?;
         if sig != b"GCOL" {
             return Err(SofaError::InvalidStructure("Bad GCOL signature".into()));
@@ -1483,7 +1591,9 @@ impl Hdf5File {
         c.skip(3)?; // reserved
         let collection_size = c.length()?;
 
-        let end = c.pos + collection_size as usize - 8 - self.len_size as usize;
+        let end = (c.pos.saturating_add(collection_size as usize))
+            .saturating_sub(8)
+            .saturating_sub(self.len_size as usize);
 
         while c.pos < end {
             let obj_index = c.u16()?;
@@ -1504,8 +1614,8 @@ impl Hdf5File {
             }
 
             // Skip object data + padding to 8-byte boundary
-            let padded_size = (obj_size as usize + 7) & !7;
-            c.pos += padded_size;
+            let padded_size = (obj_size as usize).saturating_add(7) & !7;
+            c.pos = c.pos.saturating_add(padded_size);
         }
 
         Err(SofaError::InvalidStructure(format!(
@@ -1643,7 +1753,7 @@ impl Hdf5File {
     // ---- Dataset parsing ----
 
     pub(super) fn parse_dataset(&self, addr: u64) -> Result<DatasetInfo> {
-        let offset = self.abs_offset(addr);
+        let offset = self.abs_offset(addr)?;
         let mut ds = DatasetInfo {
             dims: Vec::new(),
             dtype: DType::Float32,
@@ -1659,10 +1769,17 @@ impl Hdf5File {
         let mut attrs = HashMap::new();
         let mut filters = Vec::new();
 
-        if offset + 4 <= self.data.len() && &self.data[offset..offset + 4] == b"OHDR" {
-            self.parse_dataset_oh_v2(addr, &mut ds, &mut attrs, &mut filters)?;
-        } else {
-            self.parse_dataset_oh_v1(addr, &mut ds, &mut attrs, &mut filters)?;
+        {
+            let mut parts = DatasetParts {
+                ds: &mut ds,
+                attrs: &mut attrs,
+                filters: &mut filters,
+            };
+            if self.slice_at(offset, 4).is_ok_and(|s| s == b"OHDR") {
+                self.parse_dataset_oh_v2(addr, &mut parts)?;
+            } else {
+                self.parse_dataset_oh_v1(addr, &mut parts)?;
+            }
         }
 
         // Apply filters to chunked layout
@@ -1686,35 +1803,35 @@ impl Hdf5File {
         &self,
         msg_type: u8,
         msg_data: &[u8],
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
         is_v2_attr: bool,
     ) -> Result<()> {
         match msg_type {
             MSG_DATASPACE => {
                 let dspace = self.parse_dataspace_msg(msg_data)?;
-                ds.is_null_dataspace = dspace.is_null();
-                ds.dims = dspace.dims();
+                parts.ds.is_null_dataspace = dspace.is_null();
+                parts.ds.dims = dspace.dims();
             }
             MSG_DATATYPE => {
                 let (dt, bo) = self.parse_datatype_msg_with_order(msg_data)?;
-                ds.dtype = dt;
-                ds.byte_order = bo;
+                parts.ds.dtype = dt;
+                parts.ds.byte_order = bo;
             }
-            MSG_DATA_LAYOUT => ds.layout = self.parse_layout_msg(msg_data)?,
-            MSG_FILTER_PIPELINE => *filters = self.parse_filter_pipeline_msg(msg_data)?,
+            MSG_DATA_LAYOUT => parts.ds.layout = self.parse_layout_msg(msg_data)?,
+            MSG_FILTER_PIPELINE => {
+                *parts.filters = self.parse_filter_pipeline_msg(msg_data)?;
+            }
             MSG_ATTRIBUTE => {
                 if is_v2_attr {
-                    self.parse_attribute_msg_v2(msg_data, attrs)?;
+                    self.parse_attribute_msg_v2(msg_data, parts.attrs)?;
                 } else {
-                    self.parse_attribute_msg_v1(msg_data, attrs)?;
+                    self.parse_attribute_msg_v1(msg_data, parts.attrs)?;
                 }
             }
-            MSG_ATTR_INFO => self.parse_attr_info_msg(msg_data, attrs)?,
+            MSG_ATTR_INFO => self.parse_attr_info_msg(msg_data, parts.attrs)?,
             MSG_FILL_VALUE | MSG_FILL_VALUE_OLD => {
                 if let Some(fill) = parse_fill_value_bytes(msg_data, msg_type) {
-                    ds.fill_value = Some(fill);
+                    parts.ds.fill_value = Some(fill);
                 }
             }
             _ => {}
@@ -1725,11 +1842,9 @@ impl Hdf5File {
     pub(super) fn parse_dataset_oh_v1(
         &self,
         addr: u64,
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let version = c.u8()?;
         if version != 1 {
             return Err(SofaError::UnsupportedObjectHeader(version));
@@ -1740,7 +1855,7 @@ impl Hdf5File {
         let header_size = c.u32()?;
 
         let msg_start = c.pos;
-        let msg_end = msg_start + header_size as usize;
+        let msg_end = msg_start.saturating_add(header_size as usize);
 
         let mut i = 0u16;
         while i < num_messages && c.pos < msg_end {
@@ -1750,25 +1865,20 @@ impl Hdf5File {
             c.skip(3)?;
 
             let msg_data_start = c.pos;
-            let msg_data = &self.data[msg_data_start..msg_data_start + msg_size];
+            let msg_data = self.slice_at(msg_data_start, msg_size)?;
 
             if msg_type == MSG_OH_CONTINUATION {
-                let mut mc = Cursor::new(
-                    self.data.as_slice(),
-                    msg_data_start,
-                    self.off_size,
-                    self.len_size,
-                );
+                let mut mc = Cursor::new(msg_data, 0, self.off_size, self.len_size);
                 let cont_addr = mc.offset()?;
                 let cont_len = mc.length()?;
                 if cont_addr != UNDEF_ADDR {
-                    self.parse_dataset_oh_v1_continuation(cont_addr, cont_len, ds, attrs, filters)?;
+                    self.parse_dataset_oh_v1_continuation(cont_addr, cont_len, parts, 0)?;
                 }
             } else {
-                self.apply_dataset_msg(msg_type, msg_data, ds, attrs, filters, false)?;
+                self.apply_dataset_msg(msg_type, msg_data, parts, false)?;
             }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
             i += 1;
         }
         Ok(())
@@ -1778,25 +1888,34 @@ impl Hdf5File {
         &self,
         addr: u64,
         len: u64,
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
+        depth: u8,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
-        let end = self.abs_offset(addr) + len as usize;
+        let depth = Self::descend(depth, "Dataset object-header continuation")?;
+        let mut c = self.cursor_at(addr)?;
+        let end = c.pos.saturating_add(len as usize);
 
-        while c.pos + 8 <= end {
+        while c.pos.saturating_add(8) <= end {
             let msg_type = c.u16()? as u8;
             let msg_size = c.u16()? as usize;
             let _msg_flags = c.u8()?;
             c.skip(3)?;
 
             let msg_data_start = c.pos;
-            let msg_data = &self.data[msg_data_start..msg_data_start + msg_size];
+            let msg_data = self.slice_at(msg_data_start, msg_size)?;
 
-            self.apply_dataset_msg(msg_type, msg_data, ds, attrs, filters, false)?;
+            if msg_type == MSG_OH_CONTINUATION {
+                let mut mc = Cursor::new(msg_data, 0, self.off_size, self.len_size);
+                let cont_addr = mc.offset()?;
+                let cont_len = mc.length()?;
+                if cont_addr != UNDEF_ADDR {
+                    self.parse_dataset_oh_v1_continuation(cont_addr, cont_len, parts, depth)?;
+                }
+            } else {
+                self.apply_dataset_msg(msg_type, msg_data, parts, false)?;
+            }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
         }
         Ok(())
     }
@@ -1804,11 +1923,9 @@ impl Hdf5File {
     pub(super) fn parse_dataset_oh_v2(
         &self,
         addr: u64,
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"OHDR" {
             return Err(SofaError::InvalidStructure("Bad OHDR signature".into()));
@@ -1827,16 +1944,17 @@ impl Hdf5File {
         let chunk0_size = c.read_sized(chunk_size_bytes as u8)? as usize;
         let creation_order_tracked = flags & 0x04 != 0;
 
+        // Chunk #0 size covers the messages only; the checksum follows the
+        // chunk, so the message region ends exactly at start + size.
         let chunk_data_start = c.pos;
-        let chunk_data_end = chunk_data_start + chunk0_size.saturating_sub(4);
+        let chunk_data_end = chunk_data_start.saturating_add(chunk0_size);
 
         self.parse_dataset_oh_v2_messages(
             &mut c,
             chunk_data_end,
             creation_order_tracked,
-            ds,
-            attrs,
-            filters,
+            parts,
+            0,
         )?;
 
         Ok(())
@@ -1847,11 +1965,10 @@ impl Hdf5File {
         c: &mut Cursor<'_>,
         end: usize,
         creation_order_tracked: bool,
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
+        depth: u8,
     ) -> Result<()> {
-        while c.pos + 4 <= end {
+        while c.pos.saturating_add(4) <= end {
             let msg_type = c.u8()?;
             let msg_size = c.u16()? as usize;
             let _msg_flags = c.u8()?;
@@ -1864,18 +1981,14 @@ impl Hdf5File {
             }
 
             let msg_data_start = c.pos;
-            if msg_data_start + msg_size > self.data.len() {
+            let msg_data_end = msg_data_start.saturating_add(msg_size);
+            if msg_data_end > self.data.len() {
                 break;
             }
-            let msg_data = &self.data[msg_data_start..msg_data_start + msg_size];
+            let msg_data = &self.data[msg_data_start..msg_data_end];
 
             if msg_type == MSG_OH_CONTINUATION {
-                let mut mc = Cursor::new(
-                    self.data.as_slice(),
-                    msg_data_start,
-                    self.off_size,
-                    self.len_size,
-                );
+                let mut mc = Cursor::new(msg_data, 0, self.off_size, self.len_size);
                 let cont_addr = mc.offset()?;
                 let cont_len = mc.length()?;
                 if cont_addr != UNDEF_ADDR {
@@ -1883,16 +1996,15 @@ impl Hdf5File {
                         cont_addr,
                         cont_len,
                         creation_order_tracked,
-                        ds,
-                        attrs,
-                        filters,
+                        parts,
+                        depth,
                     )?;
                 }
             } else {
-                self.apply_dataset_msg(msg_type, msg_data, ds, attrs, filters, true)?;
+                self.apply_dataset_msg(msg_type, msg_data, parts, true)?;
             }
 
-            c.pos = msg_data_start + msg_size;
+            c.pos = msg_data_start.saturating_add(msg_size);
         }
         Ok(())
     }
@@ -1902,20 +2014,22 @@ impl Hdf5File {
         addr: u64,
         len: u64,
         creation_order_tracked: bool,
-        ds: &mut DatasetInfo,
-        attrs: &mut HashMap<String, AttrValue>,
-        filters: &mut Vec<Filter>,
+        parts: &mut DatasetParts<'_>,
+        depth: u8,
     ) -> Result<()> {
-        let offset = self.abs_offset(addr);
-        let (start, end) =
-            if offset + 4 <= self.data.len() && &self.data[offset..offset + 4] == b"OCHK" {
-                (offset + 4, offset + len as usize - 4)
-            } else {
-                (offset, offset + len as usize)
-            };
+        let depth = Self::descend(depth, "Dataset object-header continuation")?;
+        let offset = self.abs_offset(addr)?;
+        let (start, end) = if self.slice_at(offset, 4).is_ok_and(|s| s == b"OCHK") {
+            (
+                offset.saturating_add(4),
+                offset.saturating_add(len as usize).saturating_sub(4),
+            )
+        } else {
+            (offset, offset.saturating_add(len as usize))
+        };
 
         let mut c = Cursor::new(&self.data, start, self.off_size, self.len_size);
-        self.parse_dataset_oh_v2_messages(&mut c, end, creation_order_tracked, ds, attrs, filters)
+        self.parse_dataset_oh_v2_messages(&mut c, end, creation_order_tracked, parts, depth)
     }
 
     // ---- Data Layout Message ----
@@ -2101,15 +2215,14 @@ impl Hdf5File {
         match ds.dtype {
             DType::Float32 => {
                 let bytes = self.trim_dataset_bytes(name, ds, &raw, 4)?;
-                Ok(bytes
-                    .chunks_exact(4)
-                    .map(|c| read_f32_bytes(c, bo))
-                    .collect())
+                let (chunks, _) = bytes.as_chunks::<4>();
+                Ok(chunks.iter().map(|c| read_f32_bytes(c, bo)).collect())
             }
             DType::Float64 => {
                 let bytes = self.trim_dataset_bytes(name, ds, &raw, 8)?;
-                Ok(bytes
-                    .chunks_exact(8)
+                let (chunks, _) = bytes.as_chunks::<8>();
+                Ok(chunks
+                    .iter()
                     .map(|c| read_f64_bytes(c, bo) as f32)
                     .collect())
             }
@@ -2133,17 +2246,16 @@ impl Hdf5File {
         match ds.dtype {
             DType::Float32 => {
                 let bytes = self.trim_dataset_bytes(name, ds, &raw, 4)?;
-                Ok(bytes
-                    .chunks_exact(4)
+                let (chunks, _) = bytes.as_chunks::<4>();
+                Ok(chunks
+                    .iter()
                     .map(|c| read_f32_bytes(c, bo) as f64)
                     .collect())
             }
             DType::Float64 => {
                 let bytes = self.trim_dataset_bytes(name, ds, &raw, 8)?;
-                Ok(bytes
-                    .chunks_exact(8)
-                    .map(|c| read_f64_bytes(c, bo))
-                    .collect())
+                let (chunks, _) = bytes.as_chunks::<8>();
+                Ok(chunks.iter().map(|c| read_f64_bytes(c, bo)).collect())
             }
             DType::Compound => Err(SofaError::Unsupported(format!(
                 "Dataset '{}' uses unsupported compound datatype",
@@ -2278,16 +2390,13 @@ impl Hdf5File {
                     let total = self.expected_dataset_bytes(ds, ds.dtype.element_size())?;
                     return self.fill_buffer(ds, total).map(Cow::Owned);
                 }
-                let off = self.abs_offset(*address);
-                let end = off + *size as usize;
-                if end > self.data.len() {
-                    return Err(SofaError::Truncated {
-                        offset: *address,
-                        need: *size,
-                        have: (self.data.len() - off) as u64,
-                    });
-                }
-                Ok(Cow::Borrowed(&self.data[off..end]))
+                let off = self.abs_offset(*address)?;
+                let size = usize::try_from(*size).map_err(|_| {
+                    SofaError::InvalidStructure(format!(
+                        "Contiguous dataset size {size} overflows usize"
+                    ))
+                })?;
+                Ok(Cow::Borrowed(self.slice_at(off, size)?))
             }
             Layout::Chunked {
                 address,
@@ -2324,14 +2433,14 @@ impl Hdf5File {
         };
 
         // Parse B-tree v1 for chunk index
-        self.read_chunks_btree_v1(
-            btree_addr,
-            &ds.dims,
-            &chunk_element_dims,
+        let mut walk = ChunkWalk {
+            ds_dims: &ds.dims,
+            chunk_dims: &chunk_element_dims,
             elem_size,
             filters,
-            &mut output,
-        )?;
+            output: &mut output,
+        };
+        self.read_chunks_btree_v1(btree_addr, &mut walk, 0)?;
 
         Ok(output)
     }
@@ -2339,13 +2448,11 @@ impl Hdf5File {
     pub(super) fn read_chunks_btree_v1(
         &self,
         addr: u64,
-        ds_dims: &[u64],
-        chunk_dims: &[u32],
-        elem_size: usize,
-        filters: &[Filter],
-        output: &mut [u8],
+        walk: &mut ChunkWalk<'_>,
+        depth: u8,
     ) -> Result<()> {
-        let mut c = self.cursor_at(addr);
+        let depth = Self::descend(depth, "Chunk B-tree v1")?;
+        let mut c = self.cursor_at(addr)?;
         let sig = c.bytes(4)?;
         if sig != b"TREE" {
             return Err(SofaError::InvalidStructure(
@@ -2365,7 +2472,7 @@ impl Hdf5File {
             )));
         }
 
-        let ndims = ds_dims.len();
+        let ndims = walk.ds_dims.len();
 
         if node_level == 0 {
             // Leaf: each entry has chunk_size(4), filter_mask(4), offset[ndims+1](each 8 bytes), then child address
@@ -2383,15 +2490,19 @@ impl Hdf5File {
 
                 if child_addr != UNDEF_ADDR {
                     let raw_chunk = self.read_raw_bytes(child_addr, chunk_size as usize)?;
-                    let decompressed =
-                        self.decompress_chunk(raw_chunk, filters, filter_mask, elem_size)?;
+                    let decompressed = self.decompress_chunk(
+                        raw_chunk,
+                        walk.filters,
+                        filter_mask,
+                        walk.elem_size,
+                    )?;
                     self.copy_chunk_to_output(
                         decompressed.as_ref(),
                         &chunk_offset[..ndims],
-                        ds_dims,
-                        chunk_dims,
-                        elem_size,
-                        output,
+                        walk.ds_dims,
+                        walk.chunk_dims,
+                        walk.elem_size,
+                        walk.output,
                     );
                 }
             }
@@ -2405,9 +2516,7 @@ impl Hdf5File {
                 }
                 let child_addr = c.offset()?;
                 if child_addr != UNDEF_ADDR {
-                    self.read_chunks_btree_v1(
-                        child_addr, ds_dims, chunk_dims, elem_size, filters, output,
-                    )?;
+                    self.read_chunks_btree_v1(child_addr, walk, depth)?;
                 }
             }
         }
@@ -2422,15 +2531,8 @@ impl Hdf5File {
     }
 
     pub(super) fn read_raw_bytes(&self, addr: u64, size: usize) -> Result<&[u8]> {
-        let off = self.abs_offset(addr);
-        if off + size > self.data.len() {
-            return Err(SofaError::Truncated {
-                offset: addr,
-                need: size as u64,
-                have: (self.data.len() - off) as u64,
-            });
-        }
-        Ok(&self.data[off..off + size])
+        let off = self.abs_offset(addr)?;
+        self.slice_at(off, size)
     }
 
     pub(super) fn decompress_chunk<'a>(
@@ -2531,21 +2633,25 @@ impl Hdf5File {
 
         // For multi-dimensional data, copy contiguous rows along the innermost
         // dimension instead of decoding every element's coordinates.
+        // Chunk dimensions come straight from the file, so every product here
+        // saturates: absurd values fail the bounds checks below and copy
+        // nothing instead of panicking on overflow.
         let mut out_strides = vec![1usize; ndims];
         for i in (0..ndims - 1).rev() {
-            out_strides[i] = out_strides[i + 1] * ds_dims[i + 1] as usize;
+            out_strides[i] = out_strides[i + 1].saturating_mul(ds_dims[i + 1] as usize);
         }
 
         let mut chunk_strides = vec![1usize; ndims];
         for i in (0..ndims - 1).rev() {
-            chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1] as usize;
+            chunk_strides[i] = chunk_strides[i + 1].saturating_mul(chunk_dims[i + 1] as usize);
         }
 
         let last_dim = ndims - 1;
         let mut prefix_strides = vec![1usize; last_dim];
         if last_dim > 0 {
             for i in (0..last_dim - 1).rev() {
-                prefix_strides[i] = prefix_strides[i + 1] * chunk_dims[i + 1] as usize;
+                prefix_strides[i] =
+                    prefix_strides[i + 1].saturating_mul(chunk_dims[i + 1] as usize);
             }
         }
         let row_elems = chunk_dims[last_dim] as usize;
@@ -2554,8 +2660,10 @@ impl Hdf5File {
             return;
         }
         let copy_elems = row_elems.min(ds_dims[last_dim] as usize - global_last_start);
-        let copy_bytes = copy_elems * elem_size;
-        let prefix_total: usize = chunk_dims[..last_dim].iter().map(|&d| d as usize).product();
+        let copy_bytes = copy_elems.saturating_mul(elem_size);
+        let prefix_total: usize = chunk_dims[..last_dim]
+            .iter()
+            .fold(1usize, |acc, &d| acc.saturating_mul(d as usize));
 
         for prefix_flat in 0..prefix_total {
             let mut remaining = prefix_flat;
@@ -2564,23 +2672,25 @@ impl Hdf5File {
             let mut chunk_flat = 0usize;
 
             for d in 0..last_dim {
-                let local_idx = remaining / prefix_strides[d];
-                remaining %= prefix_strides[d];
+                // prefix_strides[d] is at least 1, so division is safe.
+                let local_idx = remaining / prefix_strides[d].max(1);
+                remaining %= prefix_strides[d].max(1);
 
-                let global_idx = chunk_offset[d] as usize + local_idx;
+                let global_idx = (chunk_offset[d] as usize).saturating_add(local_idx);
                 if global_idx >= ds_dims[d] as usize {
                     in_bounds = false;
                     break;
                 }
-                out_flat += global_idx * out_strides[d];
-                chunk_flat += local_idx * chunk_strides[d];
+                out_flat = out_flat.saturating_add(global_idx.saturating_mul(out_strides[d]));
+                chunk_flat = chunk_flat.saturating_add(local_idx.saturating_mul(chunk_strides[d]));
             }
 
             if in_bounds {
-                let src_start = chunk_flat * elem_size;
-                let dst_start = (out_flat + global_last_start) * elem_size;
-                if src_start + copy_bytes <= chunk_data.len()
-                    && dst_start + copy_bytes <= output.len()
+                let src_start = chunk_flat.saturating_mul(elem_size);
+                let dst_start =
+                    (out_flat.saturating_add(global_last_start)).saturating_mul(elem_size);
+                if src_start.saturating_add(copy_bytes) <= chunk_data.len()
+                    && dst_start.saturating_add(copy_bytes) <= output.len()
                 {
                     output[dst_start..dst_start + copy_bytes]
                         .copy_from_slice(&chunk_data[src_start..src_start + copy_bytes]);

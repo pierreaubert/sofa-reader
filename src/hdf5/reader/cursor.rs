@@ -76,6 +76,14 @@ impl<'a> Cursor<'a> {
             4 => self.u32().map(|v| v as u64),
             8 => self.u64(),
             _ => {
+                // Offset/length sizes come from the superblock; HDF5 allows
+                // at most 8. Anything larger is corruption, and shifting by
+                // `i * 8` for `i >= 8` would panic.
+                if size > 8 {
+                    return Err(SofaError::InvalidStructure(format!(
+                        "Offset/length size {size} exceeds 8 bytes"
+                    )));
+                }
                 self.check(size as usize)?;
                 let mut v = 0u64;
                 for i in 0..size as usize {

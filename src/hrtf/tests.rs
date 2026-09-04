@@ -518,3 +518,149 @@ fn test_receiver_position_sofa_layout() {
     let out = super::misc::receiver_position_sofa_layout(input, 2);
     assert_eq!(out, input);
 }
+
+fn inconsistent_sofa_file() -> SofaFile {
+    // Declares 3 measurements of length 4 but carries 1 position and 8 IR
+    // samples: every getter must return `None`, never panic.
+    SofaFile {
+        sample_rate: 48000.0,
+        num_measurements: 3,
+        ir_length: 4,
+        positions: vec![SourcePosition::new(0.0, 0.0, 1.0)],
+        impulse_responses: vec![0.0; 8],
+        convention: "test".to_string(),
+        data_sample_rate: Some(48000.0),
+    }
+}
+
+#[test]
+fn test_get_hrtf_slices_inconsistent_state_returns_none() {
+    let sf = inconsistent_sofa_file();
+    // Index 0 happens to be fully backed; anything beyond is not.
+    assert!(sf.get_hrtf_slices(0).is_some());
+    assert!(sf.get_hrtf_slices(1).is_none());
+    assert!(sf.get_hrtf_slices(2).is_none());
+    assert!(sf.get_hrtf_slices(99).is_none());
+}
+
+#[test]
+fn test_get_hrtf_short_buffer_returns_none() {
+    let sf = SofaFile {
+        sample_rate: 48000.0,
+        num_measurements: 1,
+        ir_length: 4,
+        positions: vec![SourcePosition::new(0.0, 0.0, 1.0)],
+        impulse_responses: vec![1.0; 4],
+        convention: "test".to_string(),
+        data_sample_rate: Some(48000.0),
+    };
+    assert!(sf.get_hrtf_slices(0).is_none());
+    assert!(sf.get_hrtf(0).is_none());
+    let mut left = [0.0f32; 4];
+    let mut right = [0.0f32; 4];
+    assert!(sf.get_hrtf_into(0, &mut left, &mut right).is_none());
+    assert!(
+        sf.get_hrtf_interpolated(&SourcePosition::new(0.0, 0.0, 1.0))
+            .is_none()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+fn write_hrtfdb(
+    path: &std::path::Path,
+    num_measurements: usize,
+    ir_length: usize,
+    positions: &[SourcePosition],
+    impulse_responses: &[f32],
+) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE data (key TEXT PRIMARY KEY, value BLOB NOT NULL);",
+    )
+    .unwrap();
+    let meta = [
+        ("convention", "test".to_string()),
+        ("sample_rate", "48000".to_string()),
+        ("ir_length", ir_length.to_string()),
+        ("num_measurements", num_measurements.to_string()),
+    ];
+    for (k, v) in meta {
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![k, v],
+        )
+        .unwrap();
+    }
+    let pos_blob = bincode::serde::encode_to_vec(positions, bincode::config::standard()).unwrap();
+    let mut ir_blob = Vec::with_capacity(impulse_responses.len() * 4);
+    for s in impulse_responses {
+        ir_blob.extend_from_slice(&s.to_le_bytes());
+    }
+    conn.execute(
+        "INSERT INTO data (key, value) VALUES ('positions', ?1)",
+        rusqlite::params![pos_blob],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO data (key, value) VALUES ('impulse_responses', ?1)",
+        rusqlite::params![ir_blob],
+    )
+    .unwrap();
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn test_try_load_sqlite_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ok.hrtfdb");
+    let positions = vec![
+        SourcePosition::new(0.0, 0.0, 1.0),
+        SourcePosition::new(90.0, 0.0, 1.0),
+    ];
+    let ir: Vec<f32> = (0..8).map(|i| i as f32).collect();
+    write_hrtfdb(&path, 2, 2, &positions, &ir);
+
+    let sf = SofaFile::try_load_sqlite(&path).unwrap();
+    assert_eq!(sf.num_measurements, 2);
+    assert_eq!(sf.ir_length, 2);
+    assert_eq!(sf.positions.len(), 2);
+    let (_, left, _) = sf.get_hrtf_slices(1).unwrap();
+    assert_eq!(left, &[4.0, 5.0]);
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn test_try_load_sqlite_rejects_short_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.hrtfdb");
+    // M=1, N=2 needs 1*2*2 = 4 samples; store only 1.
+    write_hrtfdb(&path, 1, 2, &[SourcePosition::new(0.0, 0.0, 1.0)], &[0.5]);
+
+    let err = SofaFile::try_load_sqlite(&path).unwrap_err();
+    assert!(
+        matches!(err, crate::SofaError::InvalidStructure(ref msg) if msg.contains("impulse")),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn test_try_load_sqlite_rejects_position_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mismatch.hrtfdb");
+    // Metadata claims M=2 but only one position is stored.
+    write_hrtfdb(
+        &path,
+        2,
+        1,
+        &[SourcePosition::new(0.0, 0.0, 1.0)],
+        &[0.0; 4],
+    );
+
+    let err = SofaFile::try_load_sqlite(&path).unwrap_err();
+    assert!(
+        matches!(err, crate::SofaError::InvalidStructure(ref msg) if msg.contains("positions")),
+        "unexpected error: {err}"
+    );
+}

@@ -36,25 +36,25 @@ pub fn write_simple_free_field_hrtf<P: AsRef<Path>>(
     writer.write_f64("Data.Imag", h.imag)?;
     writer.add_variable_f64("N", &["N"]);
     writer.write_f64("N", h.frequencies)?;
-    writer.add_variable_attribute_str("N", "Units", "hertz");
+    writer.add_variable_attribute_str("N", "Units", "hertz")?;
 
     writer.add_variable_f64("SourcePosition", &["M", "C"]);
     writer.write_f64("SourcePosition", h.source_position)?;
-    add_coordinate_attributes(&mut writer, "SourcePosition", h.source_coords);
+    add_coordinate_attributes(&mut writer, "SourcePosition", h.source_coords)?;
 
     let receiver_position = receiver_position_sofa_layout(h.receiver_position, h.receivers);
     writer.add_variable_f64("ReceiverPosition", &["R", "C", "I"]);
     writer.write_f64("ReceiverPosition", &receiver_position)?;
-    add_coordinate_attributes(&mut writer, "ReceiverPosition", h.receiver_coords);
+    add_coordinate_attributes(&mut writer, "ReceiverPosition", h.receiver_coords)?;
 
     let listener_position = h.listener_position.unwrap_or([0.0, 0.0, 0.0]);
     writer.add_variable_f64("ListenerPosition", &["I", "C"]);
     writer.write_f64("ListenerPosition", &listener_position)?;
-    add_coordinate_attributes(&mut writer, "ListenerPosition", CoordinateSystem::Cartesian);
+    add_coordinate_attributes(&mut writer, "ListenerPosition", CoordinateSystem::Cartesian)?;
 
     writer.add_variable_f64("EmitterPosition", &["C", "I"]);
     writer.write_f64("EmitterPosition", &[0.0, 0.0, 0.0])?;
-    add_coordinate_attributes(&mut writer, "EmitterPosition", CoordinateSystem::Cartesian);
+    add_coordinate_attributes(&mut writer, "EmitterPosition", CoordinateSystem::Cartesian)?;
 
     writer.finish(path)
 }
