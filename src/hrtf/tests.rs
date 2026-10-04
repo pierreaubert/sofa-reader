@@ -631,6 +631,63 @@ fn test_try_load_sqlite_round_trip() {
 
 #[test]
 #[cfg(feature = "sqlite")]
+fn sqlite_rate_keeps_fractional_clock_and_accepts_legacy_integer_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rate.hrtfdb");
+    let positions = vec![SourcePosition::new(0.0, 0.0, 1.0)];
+    write_hrtfdb(&path, 1, 2, &positions, &[1.0, 0.0, 1.0, 0.0]);
+    assert_eq!(SofaFile::try_load_sqlite(&path).unwrap().sample_rate, 48_000.0);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE metadata SET value = ?1 WHERE key = 'sample_rate'",
+        ["12345.678"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('data_sample_rate', ?1)",
+        ["12345.678"],
+    )
+    .unwrap();
+    let loaded = SofaFile::try_load_sqlite(&path).unwrap();
+    assert_eq!(loaded.sample_rate, 12_345.678);
+    assert_eq!(loaded.data_sample_rate, Some(12_345.678));
+}
+
+#[test]
+fn hdf5_float32_and_float64_rate_scalars_load_without_owned_f32_truncation() {
+    for use_f64 in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate.sofa");
+        let mut writer = crate::SofaWriter::new();
+        writer.add_attribute_str("Conventions", "SOFA");
+        writer.add_attribute_str("SOFAConventions", "SimpleFreeFieldHRIR");
+        writer.add_dimension("M", 1);
+        writer.add_dimension("R", 2);
+        writer.add_dimension("N", 2);
+        writer.add_dimension("C", 3);
+        if use_f64 {
+            writer.add_variable_f64("Data.SamplingRate", &[]);
+            writer.write_scalar_f64("Data.SamplingRate", 12_345.678).unwrap();
+        } else {
+            writer.add_variable_f32("Data.SamplingRate", &[]);
+            writer.write_scalar_f32("Data.SamplingRate", 48_000.0).unwrap();
+        }
+        writer.add_variable_f32("SourcePosition", &["M", "C"]);
+        writer.write_f32("SourcePosition", &[0.0, 0.0, 1.0]).unwrap();
+        writer.add_variable_f32("Data.IR", &["M", "R", "N"]);
+        writer.write_f32("Data.IR", &[1.0, 0.0, 1.0, 0.0]).unwrap();
+        writer.finish(&path).unwrap();
+
+        let loaded = SofaFile::try_load(&path).unwrap();
+        let expected = if use_f64 { 12_345.678 } else { 48_000.0 };
+        assert_eq!(loaded.sample_rate, expected);
+        assert_eq!(loaded.data_sample_rate, Some(expected));
+    }
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
 fn test_try_load_sqlite_rejects_short_blob() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("short.hrtfdb");
