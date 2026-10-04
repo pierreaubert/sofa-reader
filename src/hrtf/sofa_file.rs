@@ -10,7 +10,7 @@ use std::path::Path;
 #[derive(Clone, Debug)]
 pub struct SofaFile {
     /// Sample rate in Hz.
-    pub sample_rate: f32,
+    pub sample_rate: f64,
     /// Number of source positions.
     pub num_measurements: usize,
     /// Length of each impulse response in samples.
@@ -22,7 +22,7 @@ pub struct SofaFile {
     /// SOFA convention used by the file.
     pub convention: String,
     /// Data sampling rate from the SOFA file, when available.
-    pub data_sample_rate: Option<f32>,
+    pub data_sample_rate: Option<f64>,
 }
 
 impl SofaFile {
@@ -85,7 +85,7 @@ impl SofaFile {
             .ok_or_else(|| {
                 SofaError::InvalidStructure("Missing 'sample_rate' in SQLite metadata".to_string())
             })?
-            .parse::<f32>()
+            .parse::<f64>()
             .map_err(|e| SofaError::InvalidStructure(format!("Invalid sample_rate: {e}")))?;
         let ir_length = metadata
             .get("ir_length")
@@ -105,7 +105,7 @@ impl SofaFile {
             .map_err(|e| SofaError::InvalidStructure(format!("Invalid num_measurements: {e}")))?;
         let data_sample_rate = metadata
             .get("data_sample_rate")
-            .and_then(|s| s.parse::<f32>().ok());
+            .and_then(|s| s.parse::<f64>().ok());
 
         let positions: Vec<SourcePosition> = {
             let blob: Vec<u8> = conn.query_row(
@@ -212,8 +212,8 @@ impl SofaFile {
         }
 
         let sample_rate = reader
-            .read_scalar_f32("Data.SamplingRate")
-            .or_else(|_| reader.attribute_f64("Data.SamplingRate").map(|v| v as f32))
+            .read_scalar_f64("Data.SamplingRate")
+            .or_else(|_| reader.attribute_f64("Data.SamplingRate"))
             .map_err(|e| {
                 SofaError::InvalidStructure(format!("Failed to read Data.SamplingRate: {e}"))
             })?;
