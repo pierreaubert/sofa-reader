@@ -636,7 +636,10 @@ fn sqlite_rate_keeps_fractional_clock_and_accepts_legacy_integer_text() {
     let path = dir.path().join("rate.hrtfdb");
     let positions = vec![SourcePosition::new(0.0, 0.0, 1.0)];
     write_hrtfdb(&path, 1, 2, &positions, &[1.0, 0.0, 1.0, 0.0]);
-    assert_eq!(SofaFile::try_load_sqlite(&path).unwrap().sample_rate, 48_000.0);
+    assert_eq!(
+        SofaFile::try_load_sqlite(&path).unwrap().sample_rate,
+        48_000.0
+    );
 
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute(
@@ -668,13 +671,19 @@ fn hdf5_float32_and_float64_rate_scalars_load_without_owned_f32_truncation() {
         writer.add_dimension("C", 3);
         if use_f64 {
             writer.add_variable_f64("Data.SamplingRate", &[]);
-            writer.write_scalar_f64("Data.SamplingRate", 12_345.678).unwrap();
+            writer
+                .write_scalar_f64("Data.SamplingRate", 12_345.678)
+                .unwrap();
         } else {
             writer.add_variable_f32("Data.SamplingRate", &[]);
-            writer.write_scalar_f32("Data.SamplingRate", 48_000.0).unwrap();
+            writer
+                .write_scalar_f32("Data.SamplingRate", 48_000.0)
+                .unwrap();
         }
         writer.add_variable_f32("SourcePosition", &["M", "C"]);
-        writer.write_f32("SourcePosition", &[0.0, 0.0, 1.0]).unwrap();
+        writer
+            .write_f32("SourcePosition", &[0.0, 0.0, 1.0])
+            .unwrap();
         writer.add_variable_f32("Data.IR", &["M", "R", "N"]);
         writer.write_f32("Data.IR", &[1.0, 0.0, 1.0, 0.0]).unwrap();
         writer.finish(&path).unwrap();
