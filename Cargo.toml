@@ -27,4 +27,5 @@ tempfile = "3.23"
 proptest = "1.9"
 
 [patch.crates-io]
+# Match GPUI compatibility forks: workspace patches are not inherited.
 rusty-fork = { git = "https://github.com/pierreaubert/rusty-fork.git", rev = "ee62bcd64fa6afe7fae0e52a448d716dc294e98d" }
