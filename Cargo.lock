@@ -408,7 +408,6 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rusty-fork"
 version = "0.3.1"
-source = "git+https://github.com/pierreaubert/rusty-fork.git?rev=ee62bcd64fa6afe7fae0e52a448d716dc294e98d#ee62bcd64fa6afe7fae0e52a448d716dc294e98d"
 dependencies = [
  "fnv",
  "quick-error",
