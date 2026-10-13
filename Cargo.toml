@@ -8,6 +8,11 @@ keywords = ["sofa", "hrtf", "hdf5", "netcdf", "audio"]
 categories = ["multimedia::audio", "parser-implementations"]
 description = "Pure-Rust SOFA (HDF5/NetCDF4) file reader and writer for HRTF data"
 
+# Own workspace root: with no [workspace] table, cargo walks up to the
+# all_of_sotf aggregate manifest and this crate silently joins the mono
+# workspace even for standalone builds (wrong lockfile, config, and resolve).
+[workspace]
+
 [features]
 default = ["deflate", "sqlite"]
 deflate = ["dep:flate2"]
