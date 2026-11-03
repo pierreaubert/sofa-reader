@@ -74,6 +74,18 @@ impl SofaFile {
             metadata.insert(key, value);
         }
 
+        // Unversioned caches predate schema version 1 and use the same layout.
+        if let Some(version) = metadata.get("schema_version") {
+            match version.as_str() {
+                "1" => {}
+                _ => {
+                    return Err(SofaError::Unsupported(format!(
+                        "SQLite cache schema version: {version:?}"
+                    )));
+                }
+            }
+        }
+
         let convention = metadata
             .get("convention")
             .ok_or_else(|| {
@@ -135,17 +147,23 @@ impl SofaFile {
                 ))
             })?;
 
+        let expected_bytes = expected_samples.checked_mul(4).ok_or_else(|| {
+            SofaError::InvalidStructure(format!(
+                "SQLite dimensions overflow: M={num_measurements}, N={ir_length}"
+            ))
+        })?;
+
         let impulse_responses: Vec<f32> = {
             let blob: Vec<u8> = conn.query_row(
                 "SELECT value FROM data WHERE key = 'impulse_responses'",
                 [],
                 |row| row.get(0),
             )?;
-            if !blob.len().is_multiple_of(4) || blob.len() / 4 != expected_samples {
+            if blob.len() != expected_bytes {
                 return Err(SofaError::InvalidStructure(format!(
                     "SQLite impulse blob has {} bytes, expected M*2*N*4 = {}",
                     blob.len(),
-                    expected_samples * 4
+                    expected_bytes
                 )));
             }
             let (chunks, _) = blob.as_chunks::<4>();
