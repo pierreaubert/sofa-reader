@@ -67,6 +67,10 @@ fn convert_sofa_to_sqlite(sofa_path: &Path, db_path: &Path) -> Result<()> {
     // Insert metadata
     let tx = conn.transaction()?;
     tx.execute(
+        "INSERT INTO metadata (key, value) VALUES ('schema_version', '1')",
+        [],
+    )?;
+    tx.execute(
         "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
         ["convention", &sofa.convention],
     )?;
